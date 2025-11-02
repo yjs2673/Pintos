@@ -89,11 +89,22 @@ timer_elapsed (int64_t then)
 void
 timer_sleep (int64_t ticks) 
 {
+  /*
   int64_t start = timer_ticks ();
 
   ASSERT (intr_get_level () == INTR_ON);
   while (timer_elapsed (start) < ticks) 
     thread_yield ();
+  */
+
+  /* 0 이하의 틱 동안 sleep을 요청하면 즉시 리턴 */
+  if (ticks <= 0) return; 
+
+  int64_t start = timer_ticks();
+  ASSERT (intr_get_level() == INTR_ON);
+
+  /* 스레드가 깨어나야 할 절대적인 틱 시간을 계산하여 thread_sleep 호출 */
+  thread_sleep(start + ticks);
 }
 
 /* Sleeps for approximately MS milliseconds.  Interrupts must be

@@ -110,6 +110,9 @@ struct thread
     bool load_success;                  /* 프로세스 로드 성공 여부 */
 #endif
 
+   /* Threads */
+   int64_t wakeup_tick;                /* 깨어날 틱 시간을 저장 */
+
     /* Owned by thread.c. */
     unsigned magic;                     /* Detects stack overflow. */
   };

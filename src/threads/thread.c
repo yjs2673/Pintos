@@ -14,6 +14,7 @@
 #ifdef USERPROG
 #include "userprog/process.h"
 #endif
+#include "devices/timer.h"
 
 /* Random value for struct thread's `magic' member.
    Used to detect stack overflow.  See the big comment at the top
@@ -23,6 +24,9 @@
 /* List of processes in THREAD_READY state, that is, processes
    that are ready to run but not actually running. */
 static struct list ready_list;
+
+/* List of processes in BLOCKED state */
+static struct list sleep_list;
 
 /* List of all processes.  Processes are added to this list
    when they are first scheduled and removed when they exit. */
@@ -71,6 +75,9 @@ static void schedule (void);
 void thread_schedule_tail (struct thread *prev);
 static tid_t allocate_tid (void);
 
+/* sleep_list를 검사하여 깨울 스레드를 깨우는 함수 */
+static void thread_wake_up (void);
+
 /* Initializes the threading system by transforming the code
    that's currently running into a thread.  This can't work in
    general and it is possible in this case only because loader.S
@@ -92,6 +99,7 @@ thread_init (void)
   lock_init (&tid_lock);
   list_init (&ready_list);
   list_init (&all_list);
+  list_init (&sleep_list); // init BLOCKED processes list
 
   /* Set up a thread structure for the running thread. */
   initial_thread = running_thread ();
@@ -137,6 +145,9 @@ thread_tick (void)
   /* Enforce preemption. */
   if (++thread_ticks >= TIME_SLICE)
     intr_yield_on_return ();
+
+  /* 매 틱마다 깨어날 스레드가 있는지 검사 */
+  thread_wake_up ();
 }
 
 /* Prints thread statistics. */
@@ -591,6 +602,66 @@ allocate_tid (void)
   return tid;
 }
 
+
+/*
+ * 현재 스레드를 wakeup_tick까지 재웁니다.
+ * thread_block()을 호출하므로 인터럽트가 활성화된 상태(INTR_ON)에서
+ * 호출되어야 합니다.
+ */
+void
+thread_sleep (int64_t wakeup_tick)
+{
+  struct thread *cur = thread_current ();
+  enum intr_level old_level;
+
+  /* 인터럽트 핸들러나 외부 인터럽트 컨텍스트에서 호출되면 안 됨 */
+  ASSERT (!intr_context ());
+  ASSERT (intr_get_level () == INTR_ON);
+
+  /* 스레드 구조체에 깨어날 시간 저장 [cite: 300] */
+  cur->wakeup_tick = wakeup_tick;
+
+  /*
+    sleep_list에 추가하고 스레드를 BLOCKED 상태로 만듦 [cite: 298, 299]
+    이 과정은 원자적으로(atomically) 일어나야 하므로 인터럽트를 비활성화합니다.
+  */
+  old_level = intr_disable ();
+  list_push_back (&sleep_list, &cur->elem);
+  thread_block ();
+  
+  /* thread_wake_up() -> thread_unblock()에 의해 스레드가 다시 깨어나면
+    스케줄러에 의해 이 지점부터 실행이 재개됩니다.
+    원래의 인터럽트 레벨을 복원합니다.
+  */
+  intr_set_level (old_level);
+}
+
+/*
+ * sleep_list를 순회하며 깨어날 시간이 된(wakeup_tick <= current_ticks) 모든 스레드 unblock
+ * timer_interrupt -> thread_tick 문맥(INTR_OFF)에서 호출
+ */
+static void
+thread_wake_up (void)
+{
+  int64_t current_ticks = timer_ticks (); /* 현재 틱 시간 */
+  struct list_elem *e = list_begin (&sleep_list);
+
+  /* sleep_list를 순회 */
+  while (e != list_end (&sleep_list))
+  {
+    struct thread *t = list_entry (e, struct thread, elem);
+      
+    if (t->wakeup_tick <= current_ticks) /* 스레드가 깨어날 시간인지 확인 */
+    {
+        struct list_elem *next = list_next (e);
+        list_remove (e);      /* sleep_list에서 제거 */
+        thread_unblock (t);   /* ready_list로 이동시킴 */      
+        e = next;
+    }
+    else e = list_next (e);
+  }
+}
+
 /* Offset of `stack' member within `struct thread'.
    Used by switch.S, which can't figure it out on its own. */
 uint32_t thread_stack_ofs = offsetof (struct thread, stack);
