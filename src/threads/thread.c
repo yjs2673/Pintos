@@ -63,6 +63,9 @@ static unsigned thread_ticks;   /* # of timer ticks since last yield. */
    Controlled by kernel command-line option "-o mlfqs". */
 bool thread_mlfqs;
 
+bool thread_prior_aging;
+void thread_aging (void);
+
 static void kernel_thread (thread_func *, void *aux);
 
 static void idle (void *aux UNUSED);
@@ -74,6 +77,30 @@ static void *alloc_frame (struct thread *, size_t size);
 static void schedule (void);
 void thread_schedule_tail (struct thread *prev);
 static tid_t allocate_tid (void);
+
+bool
+thread_priority_greater (const struct list_elem *a,
+                         const struct list_elem *b,
+                         void *aux UNUSED)
+{
+  const struct thread *ta = list_entry (a, struct thread, elem);
+  const struct thread *tb = list_entry (b, struct thread, elem);
+  return ta->priority > tb->priority;
+}
+
+void
+thread_check_preemption (void)
+{
+  /* ready_list가 비어있으면 선점할 스레드가 없음 */
+  if (list_empty (&ready_list)) return;
+  
+  /* 현재 스레드가 idle 스레드이거나 인터럽트 컨텍스트에서는 yield 불가 */
+  if (thread_current () == idle_thread || intr_context ()) return;
+
+  /* ready_list의 맨 앞(가장 높은 우선순위) 스레드와 비교 */
+  struct thread *highest_ready = list_entry (list_front (&ready_list), struct thread, elem);
+  if (thread_current ()->priority < highest_ready->priority) thread_yield ();
+}
 
 /* Initializes the threading system by transforming the code
    that's currently running into a thread.  This can't work in
@@ -145,6 +172,15 @@ thread_tick (void)
 
   /* 매 틱마다 깨어날 스레드가 있는지 검사 */
   thread_wake_up ();
+
+  if (thread_prior_aging == true) thread_aging ();
+
+  if (!list_empty(&ready_list) &&
+      thread_current ()->priority < 
+      list_entry(list_front(&ready_list), struct thread, elem)->priority)
+  {
+    intr_yield_on_return ();
+  }
 }
 
 /* Prints thread statistics. */
@@ -209,6 +245,9 @@ thread_create (const char *name, int priority,
   /* Add to run queue. */
   thread_unblock (t);
 
+  /* 새 스레드의 우선순위가 현재 스레드보다 높으면 CPU 양보 */
+  if (t->priority > thread_current ()->priority) thread_yield ();
+
   return tid;
 }
 
@@ -245,7 +284,9 @@ thread_unblock (struct thread *t)
 
   old_level = intr_disable ();
   ASSERT (t->status == THREAD_BLOCKED);
-  list_push_back (&ready_list, &t->elem);
+
+  list_insert_ordered (&ready_list, &t->elem, thread_priority_greater, NULL);
+  
   t->status = THREAD_READY;
   intr_set_level (old_level);
 }
@@ -315,8 +356,7 @@ thread_yield (void)
   ASSERT (!intr_context ());
 
   old_level = intr_disable ();
-  if (cur != idle_thread) 
-    list_push_back (&ready_list, &cur->elem);
+  if (cur != idle_thread) list_insert_ordered (&ready_list, &cur->elem, thread_priority_greater, NULL);
   cur->status = THREAD_READY;
   schedule ();
   intr_set_level (old_level);
@@ -343,7 +383,22 @@ thread_foreach (thread_action_func *func, void *aux)
 void
 thread_set_priority (int new_priority) 
 {
-  thread_current ()->priority = new_priority;
+  /* MLFQS 스케줄러가 아닐 때만 작동 */
+  if (thread_mlfqs) return;
+
+  enum intr_level old_level = intr_disable ();
+  
+  struct thread *cur = thread_current ();
+  cur->base_priority = new_priority;
+
+  /* 기부받은 우선순위가 있는지 확인하여 priority update*/
+  thread_recalculate_priority (cur);
+
+  /* 우선순위가 낮아졌을 경우, ready_list의 다른 스레드보다
+     우선순위가 낮아졌는지 확인하고, 그렇다면 yield */
+  thread_check_preemption ();
+  
+  intr_set_level (old_level);
 }
 
 /* Returns the current thread's priority. */
@@ -471,6 +526,10 @@ init_thread (struct thread *t, const char *name, int priority)
   t->stack = (uint8_t *) t + PGSIZE;
   t->priority = priority;
   t->magic = THREAD_MAGIC;
+
+  t->base_priority = priority;
+  list_init (&t->held_locks);
+  t->waiting_on_lock = NULL;
 
   old_level = intr_disable ();
   list_push_back (&all_list, &t->allelem);
@@ -657,6 +716,100 @@ thread_wake_up (void)
     }
     else e = list_next (e);
   }
+}
+
+void
+thread_aging (void)
+{
+  ASSERT (intr_get_level () == INTR_OFF);
+
+  struct list_elem *e;
+  
+  /* 1. ready_list 순회 */
+  for (e = list_begin (&ready_list); e != list_end (&ready_list); e = list_next (e))
+  {
+    struct thread *t = list_entry (e, struct thread, elem);
+    if (t->base_priority < PRI_MAX)
+    {
+      t->base_priority++;
+      /* 유효 우선순위(priority)도 갱신 */
+      thread_recalculate_priority (t);
+    }
+  }
+
+  /* 2. sleep_list 순회 */
+  for (e = list_begin (&sleep_list); e != list_end (&sleep_list); e = list_next (e))
+  {
+    struct thread *t = list_entry (e, struct thread, elem);
+    if (t->base_priority < PRI_MAX)
+    {
+      t->base_priority++;
+      /* BLOCKED 상태 스레드는 당장 스케줄링 대상이 아니므로
+         recalculate_priority()는 생략 가능 (unblock될 때 갱신됨)
+      */
+    }
+  }
+
+  /* 3. ready_list 재정렬 */
+  list_sort (&ready_list, thread_priority_greater, NULL);
+}
+
+void
+thread_donate_priority (struct thread *t)
+{
+  /* 기부는 인터럽트가 비활성화된 상태에서 호출 */
+  /* lock_acquire -> sema_down 내부에서 호출 */
+  
+  ASSERT (intr_get_level () == INTR_OFF);
+
+  struct thread *cur = thread_current ();
+  
+  /* t (lock holder)의 유효 우선순위를 현재 스레드(waiter)의 우선순위로 업데이트 */
+  if (t->priority < cur->priority)
+  {
+    t->priority = cur->priority;
+      
+    /* Holder(t)가 다른 lock을 기다리고 있다면 (nested donation),
+      그 lock의 holder에게도 재귀적으로 기부 */
+    if (t->waiting_on_lock) thread_donate_priority (t->waiting_on_lock->holder);
+  }
+}
+
+/*
+ * Priority Recalculation:
+ * 스레드 t가 lock을 해제(release)했거나, base_priority가 변경되었을 때 호출
+ * t의 유효 우선순위(priority)를 (t->base_priority) 와 (t가 보유한 모든 lock을 기다리는 스레드들의 최대 우선순위) 중 더 큰 값으로 설정
+ */
+void
+thread_recalculate_priority (struct thread *t)
+{
+  ASSERT (intr_get_level () == INTR_OFF);
+  
+  int max_priority = t->base_priority;
+
+  /* 스레드가 보유한 lock이 있는지 확인 */
+  if (!list_empty (&t->held_locks))
+  {
+    struct list_elem *e;
+    for (e = list_begin (&t->held_locks); e != list_end (&t->held_locks); e = list_next (e))
+    {
+      struct lock *l = list_entry (e, struct lock, held_elem);
+          
+      /* 그 lock을 기다리는 스레드(waiters)가 있는지 확인 */
+      if (!list_empty (&l->semaphore.waiters))
+      {
+        /* waiters 리스트는 이미 우선순위로 정렬되어 있으므로
+          맨 앞의 스레드가 가장 우선순위가 높음
+        */
+        struct thread *waiter = list_entry (list_front (&l->semaphore.waiters), 
+                                                struct thread, elem);
+            
+        if (waiter->priority > max_priority) max_priority = waiter->priority;
+      }
+    }
+  }
+  
+  t->priority = max_priority;
 }
 
 /* Offset of `stack' member within `struct thread'.

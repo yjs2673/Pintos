@@ -88,7 +88,13 @@ struct thread
     enum thread_status status;          /* Thread state. */
     char name[16];                      /* Name (for debugging purposes). */
     uint8_t *stack;                     /* Saved stack pointer. */
+    
+    /* Priority Scheduling */
     int priority;                       /* Priority. */
+    int base_priority;                  /* Original priority (기부 받기 전) */
+    struct list held_locks;             /* 현재 스레드가 보유하고 있는 lock 리스트 */
+    struct lock *waiting_on_lock;       /* 현재 스레드가 대기 중인 lock */
+    
     struct list_elem allelem;           /* List element for all threads list. */
 
     /* Shared between thread.c and synch.c. */
@@ -122,6 +128,8 @@ struct thread
    Controlled by kernel command-line option "-o mlfqs". */
 extern bool thread_mlfqs;
 
+extern bool thread_prior_aging;
+
 void thread_init (void);
 void thread_start (void);
 
@@ -153,6 +161,13 @@ void thread_set_nice (int);
 int thread_get_recent_cpu (void);
 int thread_get_load_avg (void);
 
+/* Threads */
+bool thread_priority_greater (const struct list_elem *a,
+                              const struct list_elem *b,
+                              void *aux);
+void thread_donate_priority (struct thread *t);
+void thread_recalculate_priority (struct thread *t);
+void thread_check_preemption (void);
 void thread_sleep (int64_t wakeup_tick);
 void thread_wake_up (void);
 
