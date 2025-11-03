@@ -75,9 +75,6 @@ static void schedule (void);
 void thread_schedule_tail (struct thread *prev);
 static tid_t allocate_tid (void);
 
-/* sleep_list를 검사하여 깨울 스레드를 깨우는 함수 */
-static void thread_wake_up (void);
-
 /* Initializes the threading system by transforming the code
    that's currently running into a thread.  This can't work in
    general and it is possible in this case only because loader.S
@@ -640,7 +637,7 @@ thread_sleep (int64_t wakeup_tick)
  * sleep_list를 순회하며 깨어날 시간이 된(wakeup_tick <= current_ticks) 모든 스레드 unblock
  * timer_interrupt -> thread_tick 문맥(INTR_OFF)에서 호출
  */
-static void
+void
 thread_wake_up (void)
 {
   int64_t current_ticks = timer_ticks (); /* 현재 틱 시간 */
