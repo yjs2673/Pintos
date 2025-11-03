@@ -183,6 +183,7 @@ timer_interrupt (struct intr_frame *args UNUSED)
 {
   ticks++;
   thread_tick ();
+  thread_wake_up ();
 }
 
 /* Returns true if LOOPS iterations waits for more than one timer
