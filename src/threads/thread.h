@@ -118,6 +118,9 @@ struct thread
 
     /* Threads */
     int64_t wakeup_tick;                /* 깨어날 틱 시간을 저장 */
+    /* MLFQ */
+    int nice;
+    int recent_cpu;
 
     /* Owned by thread.c. */
     unsigned magic;                     /* Detects stack overflow. */
