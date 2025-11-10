@@ -756,9 +756,8 @@ allocate_tid (void)
 
 
 /*
- * 현재 스레드를 wakeup_tick까지 재웁니다.
- * thread_block()을 호출하므로 인터럽트가 활성화된 상태(INTR_ON)에서
- * 호출되어야 합니다.
+ * 현재 스레드를 wakeup_tick까지 sleep
+ * thread_block()을 호출하므로 인터럽트가 활성화된 상태(INTR_ON)에서 호출
  */
 void
 thread_sleep (int64_t wakeup_tick)
@@ -770,21 +769,19 @@ thread_sleep (int64_t wakeup_tick)
   ASSERT (!intr_context ());
   ASSERT (intr_get_level () == INTR_ON);
 
-  /* 스레드 구조체에 깨어날 시간 저장 [cite: 300] */
+  /* 스레드 구조체에 깨어날 시간 저장 */
   cur->wakeup_tick = wakeup_tick;
 
   /*
-    sleep_list에 추가하고 스레드를 BLOCKED 상태로 만듦 [cite: 298, 299]
-    이 과정은 원자적으로(atomically) 일어나야 하므로 인터럽트를 비활성화합니다.
+    sleep_list에 추가하고 스레드를 BLOCKED 상태로 전환
+    이 과정은 원자적으로(atomically) 일어나야 하므로 인터럽트를 비활성화
   */
   old_level = intr_disable ();
   list_push_back (&sleep_list, &cur->elem);
   thread_block ();
   
   /* thread_wake_up() -> thread_unblock()에 의해 스레드가 다시 깨어나면
-    스케줄러에 의해 이 지점부터 실행이 재개됩니다.
-    원래의 인터럽트 레벨을 복원합니다.
-  */
+    스케줄러에 의해 이 지점부터 실행이 재개, 원래의 인터럽트 레벨을 복원. */
   intr_set_level (old_level);
 }
 
