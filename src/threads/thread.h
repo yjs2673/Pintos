@@ -5,6 +5,7 @@
 #include <list.h>
 #include <stdint.h>
 #include "synch.h"
+#include "lib/kernel/hash.h"
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -121,6 +122,10 @@ struct thread
     /* MLFQ */
     int nice;
     int recent_cpu;
+
+    /* Virtual Memeory */
+    struct hash vm;                     /* Supplemental Page Table (Hash Table) */
+    void *stack_esp;                    /* Syscall 시 유저 스택 포인터 저장 */
 
     /* Owned by thread.c. */
     unsigned magic;                     /* Detects stack overflow. */

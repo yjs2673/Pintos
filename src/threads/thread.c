@@ -16,6 +16,7 @@
 #endif
 #include "devices/timer.h"
 #include "threads/fixed-point.h"
+#include "vm/page.h"
 
 /* Random value for struct thread's `magic' member.
    Used to detect stack overflow.  See the big comment at the top
@@ -617,7 +618,6 @@ init_thread (struct thread *t, const char *name, int priority)
   list_push_back (&all_list, &t->allelem);
   intr_set_level (old_level);
 
-/* User Program 2*/
 #ifdef USERPROG
   sema_init(&(t->lock_load), 0);
   sema_init(&(t->lock_child), 0);
@@ -627,6 +627,7 @@ init_thread (struct thread *t, const char *name, int priority)
   t->exec_file = NULL;
   t->load_success = false;
   list_push_back(&(running_thread()->child_list), &(t->child_elem));
+  vm_init (&t->vm);
 #endif
 }
 
