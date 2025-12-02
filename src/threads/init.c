@@ -37,9 +37,6 @@
 #include "filesys/filesys.h"
 #include "filesys/fsutil.h"
 #endif
-#include "vm/frame.h"
-#include "vm/page.h"
-#include "vm/swap.h"
 
 /* Page directory with kernel mappings only. */
 uint32_t *init_page_dir;
@@ -122,11 +119,6 @@ main (void)
   thread_start ();
   serial_init_queue ();
   timer_calibrate ();
-
-  /* VM Initialization */
-  frame_init ();
-  vm_init ();
-  swap_init ();
 
 #ifdef FILESYS
   /* Initialize file system. */
@@ -264,8 +256,6 @@ parse_options (char **argv)
         random_init (atoi (value));
       else if (!strcmp (name, "-mlfqs"))
         thread_mlfqs = true;
-      else if (!strcmp (name, "-aging"))
-        thread_prior_aging = true;
 #ifdef USERPROG
       else if (!strcmp (name, "-ul"))
         user_page_limit = atoi (value);
