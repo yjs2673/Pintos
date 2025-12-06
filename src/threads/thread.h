@@ -5,6 +5,7 @@
 #include <list.h>
 #include <stdint.h>
 #include "synch.h"
+#include "lib/kernel/hash.h"
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -109,6 +110,9 @@ struct thread
     struct file* exec_file;             /* 현재 실행 중인 파일 포인터 */
     bool load_success;                  /* 프로세스 로드 성공 여부 */
 #endif
+
+    /* Virtual Memory */
+    struct hash pt;              /* Supplemental page table */
 
     /* Owned by thread.c. */
     unsigned magic;                     /* Detects stack overflow. */
