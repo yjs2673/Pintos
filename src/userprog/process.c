@@ -188,14 +188,14 @@ process_exit (void)
   /* 이전에 열었던 모든 파일들을 닫기 */
   for (int i = 2; i < 128; i++) if (cur->fd[i] != NULL) sys_close(i);
 
+  pt_destroy(&cur->pt);
+
   /* 실행 파일 닫고 쓰기를 허용 */
   if (cur->exec_file != NULL)
   {
-    file_allow_write(cur->exec_file);
-    file_close(cur->exec_file);
+    file_close(cur->exec_file); // allow_write 자동 처리됨
+    cur->exec_file = NULL;
   }
-
-  pt_destroy(&cur->pt);
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
@@ -537,6 +537,30 @@ validate_segment (const struct Elf32_Phdr *phdr, struct file *file)
   return true;
 }
 
+static struct pt_entry *
+allocate_and_init_pte (void *vaddr, pt_type type, struct file *f, off_t ofs, 
+                       size_t read_bytes, size_t zero_bytes, bool writable)
+{
+    struct pt_entry *pte = (struct pt_entry *)malloc(sizeof(struct pt_entry));
+    if (pte == NULL) return NULL;
+
+    pte->type = type;
+    pte->vaddr = vaddr;
+    pte->writable = writable;
+    
+    pte->is_loaded = (type == SWAPPED) ? true : false; 
+    
+    pte->file = f;
+    pte->offset = ofs;
+    
+    pte->read_bytes = read_bytes;
+    pte->zero_bytes = zero_bytes;
+    
+    pte->swap_slot = 0; 
+
+    return pte;
+}
+
 /* Loads a segment starting at offset OFS in FILE at address
    UPAGE.  In total, READ_BYTES + ZERO_BYTES bytes of virtual
    memory are initialized, as follows:
@@ -559,39 +583,37 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
   ASSERT (pg_ofs (upage) == 0);
   ASSERT (ofs % PGSIZE == 0);
 
-  // file_seek는 여기서 하지 않고 load_file_to_page 수행 시점에 offset을 이용해 읽음
-
   while (read_bytes > 0 || zero_bytes > 0) 
-    {
-      size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
-      size_t page_zero_bytes = PGSIZE - page_read_bytes;
+  {
+    size_t page_read_bytes = (read_bytes < PGSIZE) ? read_bytes : PGSIZE;
+    size_t page_zero_bytes = PGSIZE - page_read_bytes;
 
-      struct pt_entry *ve = malloc(sizeof(struct pt_entry));
-      if(ve == NULL) return false;
-      
-      ve->type = BINARY;
-      ve->vaddr = upage;
-      ve->read_bytes = page_read_bytes;
-      ve->zero_bytes = page_zero_bytes;
-      
-      /* [FIX] file_reopen의 반환값 체크 추가 */
-      ve->file = file_reopen(file); 
-      if (ve->file == NULL) {
-          free(ve);
-          return false;
-      }
-      
-      ve->offset = ofs;
-      ve->is_loaded = false;
-      ve->writable = writable;
-      
-      pt_insert_entry(&thread_current()->pt, ve);
+    /* 파일 재오픈 */
+    struct file *f_clone = file_reopen(file);
+    if (f_clone == NULL) return false;
 
-      read_bytes -= page_read_bytes;
-      zero_bytes -= page_zero_bytes;
-      ofs += page_read_bytes;
-      upage += PGSIZE;
+    struct pt_entry *ve = allocate_and_init_pte(upage, BINARY, f_clone, ofs,
+                                                page_read_bytes, page_zero_bytes, writable);
+      
+    if (ve == NULL) {
+      file_close(f_clone);
+      return false;
     }
+
+      
+    if (pt_insert_entry(&thread_current()->pt, ve)) {
+      /* 삽입 실패 시 롤백 */
+      free(ve);
+      file_close(f_clone);
+     return false;
+    }
+
+    /* 포인터 및 카운터 업데이트 */
+    read_bytes -= page_read_bytes;
+    zero_bytes -= page_zero_bytes;
+    ofs += page_read_bytes;
+    upage += PGSIZE;
+  }
   return true;
 }
 
@@ -601,35 +623,36 @@ static bool
 setup_stack (void **esp) 
 {
   struct frame *kpage;
-  bool success = false;
-
+  
   kpage = alloc_page (PAL_USER | PAL_ZERO);
   
-  if (kpage != NULL) 
-  {
-    success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage->kaddr, true);
-    if(!success) {
-      free_page (kpage->kaddr);
-      return success;
-    }
-    struct pt_entry *ve = (struct pt_entry *)malloc(sizeof(struct pt_entry));
-    if(ve == NULL) return false;
+  /* 메모리 할당 실패 시 즉시 리턴 */
+  if (kpage == NULL) return false;
 
-    *esp = PHYS_BASE;
-    ve->type = SWAPPED;
-    ve->vaddr = (uint8_t *)PHYS_BASE - PGSIZE;
-    ve->read_bytes = 0;
-    ve->zero_bytes = 0;  
-    ve->file = NULL;
-    ve->offset = 0;
-    ve->is_loaded = true;
-    ve->writable = true;
-    kpage->pte = ve;
-      
-    success = !pt_insert_entry (&(thread_current ()->pt), kpage->pte);
+  uint8_t *stack_base = ((uint8_t *) PHYS_BASE) - PGSIZE;
+
+  /* 페이지 설치 시도 */
+  if (!install_page (stack_base, kpage->kaddr, true)) 
+  {
+    free_page (kpage->kaddr);
+    return false;
   }
 
-  return success;
+  /* 스택용 PTE 생성 */
+  struct pt_entry *ve = allocate_and_init_pte(stack_base, SWAPPED, NULL, 0, 
+                                              0, 0, true);
+  
+  if (ve == NULL) {
+      return false;
+  }
+
+  /* 스택 페이지 특성 설정 */
+  ve->is_loaded = true; 
+  kpage->pte = ve;
+  *esp = PHYS_BASE;
+
+  /* Hash 테이블 삽입 */
+  return !pt_insert_entry (&(thread_current ()->pt), ve);
 }
 
 /* Adds a mapping from user virtual address UPAGE to kernel
@@ -639,89 +662,95 @@ setup_stack (void **esp)
    UPAGE must not already be mapped.
    KPAGE should probably be a page obtained from the user pool
    with palloc_get_page().
-   Returns true on success, false if UPAGE is already mapped or
-   if memory allocation fails. */
+   Returns true on success, false if UPAGE is already mapped. */
 static bool
 install_page (void *upage, void *kpage, bool writable)
 {
   struct thread *t = thread_current ();
-
-  /* Verify that there's not already a page at that virtual
-     address, then map our page there. */
-  return (pagedir_get_page (t->pagedir, upage) == NULL
-          && pagedir_set_page (t->pagedir, upage, kpage, writable));
-}
-
-bool//완
-handle_mm_fault (struct pt_entry *pte)
-{
-  struct frame *frm = alloc_page(PAL_USER);
-  bool success = false;
-
-  if(frm == NULL)
-    return false; // alloc_page 실패 시 false 반환
-
-  frm->pte = pte;
-  if (pte->type == BINARY) {
-    if (!load_file_to_page(frm->kaddr, pte)) {
-      free_page(frm->kaddr);
-      free(frm); // load_file_to_page 실패 시 frm 해제
+  
+  /* 이미 매핑된 페이지인지 확인 */
+  if (pagedir_get_page (t->pagedir, upage) != NULL) {
       return false;
-    }
-  } else if (pte->type == SWAPPED) {
-      swap_in(pte->swap_slot, frm->kaddr);
   }
 
-   success = install_page(pte->vaddr, frm->kaddr, pte->writable);
-   if (!success) {
-      free_page(frm->kaddr);
-      free(frm);
-      return false;
-    }
-    pte->is_loaded=true;
-    return success;
+  /* 페이지 디렉토리에 세팅 */
+  return pagedir_set_page (t->pagedir, upage, kpage, writable);
 }
 
 bool
-stack_growth (void *addr, void *esp)//완
+handle_mm_fault (struct pt_entry *pte)
 {
-  void *upage;
-  struct frame *kpage;
-  bool success = false;
+  if (pte == NULL) return false;
 
-  //에러체크  
-  if (!is_user_vaddr (addr)) return false;
-  if (addr < (PHYS_BASE - 0x8000000)) return false;//wait-killed
-  if (addr < (esp - 32)) return false;//pt_bad_read
+  struct frame *frm = alloc_page(PAL_USER);
+  if (frm == NULL) return false;
 
+  frm->pte = pte;
+  bool load_result = false;
+
+  switch (pte->type) {
+      case BINARY:
+          load_result = load_file_to_page(frm->kaddr, pte);
+          break;
+
+      case SWAPPED:
+          swap_in(pte->swap_slot, frm->kaddr);
+          load_result = true;
+          break;
+
+      default:
+          load_result = false;
+          break;
+  }
+
+  /* 로드 실패 시 정리 */
+  if (!load_result) goto error_cleanup;
+
+  /* 페이지 테이블 매핑 */
+  if (!install_page(pte->vaddr, frm->kaddr, pte->writable)) {
+      goto error_cleanup;
+  }
+
+  pte->is_loaded = true;
+  return true;
+
+error_cleanup:
+  free_page(frm->kaddr);
+  free(frm);
+  return false;
+}
+
+bool
+stack_growth (void *addr, void *esp)
+{
+  bool is_valid = is_user_vaddr (addr) &&
+                  (addr >= (void *)(PHYS_BASE - 0x8000000)) && // Stack Limit Check
+                  (addr >= (esp - 32));                        // PUSHA Heuristic
+
+  if (!is_valid) return false;
+
+  void *upage = pg_round_down (addr);
+  struct frame *kpage = alloc_page (PAL_USER | PAL_ZERO);
+
+  if (kpage == NULL) return false;
+
+  /* 설치 먼저 시도 */
+  if (!install_page (upage, kpage->kaddr, true)) {
+      free_page (kpage->kaddr);
+      return false;
+  }
+
+  /* PTE 생성 */
+  struct pt_entry *pte = allocate_and_init_pte(upage, SWAPPED, NULL, 0, 
+                                               0, 0, true);
   
-  //get upage 
-  upage = pg_round_down (addr);
+  if (pte == NULL) {
+      return false;
+  }
 
-  kpage = alloc_page (PAL_USER | PAL_ZERO);
-  if(kpage != NULL)
-    {
-      success = install_page (upage, kpage->kaddr, true);
-      if(!success){
-        free_page (kpage->kaddr);
-        return success;
-      }
+  pte->is_loaded = true;
+  kpage->pte = pte;
 
-      kpage->pte = (struct pt_entry *)malloc(sizeof(struct pt_entry));
-      if(kpage->pte == NULL) return false;
-
-      kpage->pte->type = SWAPPED;
-      kpage->pte->vaddr = upage;
-      kpage->pte->read_bytes = 0;
-      kpage->pte->zero_bytes = 0;
-      kpage->pte->file = NULL;
-      kpage->pte->offset = 0;
-      kpage->pte->is_loaded = true;
-      kpage->pte->writable = true;
-
-      success = !pt_insert_entry (&(thread_current ()->pt), kpage->pte);
-    }
-
-  return success; 
-
+  /* Hash 등록 */
+  return !pt_insert_entry (&(thread_current ()->pt), pte);
 }
