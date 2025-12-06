@@ -566,7 +566,7 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
       size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
       size_t page_zero_bytes = PGSIZE - page_read_bytes;
 
-      struct pt_entry *ve = (struct pt_entry *)malloc(sizeof(struct pt_entry));
+      struct pt_entry *ve = malloc(sizeof(struct pt_entry));
       if(ve == NULL) return false;
       
       ve->type = BINARY;

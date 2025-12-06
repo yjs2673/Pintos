@@ -10,6 +10,9 @@
 /* Partition that contains the file system. */
 struct block *fs_device;
 
+/* 전역 락 정의 */
+struct lock filesys_lock;
+
 static void do_format (void);
 
 /* Initializes the file system module.
@@ -23,6 +26,8 @@ filesys_init (bool format)
 
   inode_init ();
   free_map_init ();
+
+  lock_init(&filesys_lock); // 전역 락 초기화
 
   if (format) 
     do_format ();

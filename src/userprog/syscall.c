@@ -9,6 +9,9 @@
 #include "userprog/pagedir.h"
 #include "userprog/process.h"
 #include "threads/synch.h"
+#include "filesys/filesys.h"
+#include <string.h>
+#include <stdlib.h>
 
 typedef int pid_t;
 
@@ -19,7 +22,7 @@ void putbuf (const char *buffer, size_t n); /* lib/kernel/console.h */
 static void syscall_handler (struct intr_frame *);
 
 /* Filesystem serialization lock */
-static struct lock filesys_lock;
+// static struct lock filesys_lock;
 
 /* uaddr가 유저 영역에 매핑되어 있는지 확인 */
 static void
@@ -83,15 +86,6 @@ void sys_exit (int status)
   t->exit_status = status;
   printf ("%s: exit(%d)\n", t->name, status);
   thread_exit ();
-}
-
-pid_t sys_exec (const char *cmd_line)
-{
-  validate_cstr (cmd_line);
-  lock_acquire (&filesys_lock);
-  pid_t pid = process_execute (cmd_line);
-  lock_release (&filesys_lock);
-  return pid;
 }
 
 int sys_wait (pid_t pid)
@@ -167,87 +161,77 @@ int sys_filesize (int fd)
 
 int sys_read (int fd, void *buffer, unsigned size)
 {
-  validate_writable_buffer(buffer, size);
-  lock_acquire(&filesys_lock);
+  /* 1. 버퍼 주소 유효성 검사 (아직 쓰기 권한 체크는 안함) */
+  if (!is_user_vaddr(buffer) || !is_user_vaddr(buffer + size)) return -1;
+  if (fd == 1) return -1; // STDOUT 읽기 불가
 
-  // Read from STDIN (keyboard)
-  if (fd == 0)
-  {
-    for (unsigned i = 0; i < size; i++)
-    {
-      ((uint8_t *)buffer)[i] = input_getc();
-    }
-    lock_release(&filesys_lock);
-    return size;
-  }
-  
-  // Cannot read from STDOUT
-  if (fd == 1)
-  {
-    lock_release(&filesys_lock);
-    return -1;
+  /* 2. STDIN 처리 */
+  if (fd == 0) {
+      /* 키보드 입력은 락 불필요하거나, 필요하다면 여기서만 잡음 */
+      uint8_t *buf = (uint8_t *)buffer;
+      for (unsigned i = 0; i < size; i++) buf[i] = input_getc();
+      return size;
   }
 
-  if (fd < 2 || fd >= 128)
-  {
-    lock_release(&filesys_lock);
-    return -1;
-  }
-  
+  /* 3. 파일 처리 */
   struct thread *t = thread_current();
+  if (fd < 2 || fd >= 128) return -1;
   struct file *f = t->fd[fd];
+  if (f == NULL) return -1;
 
-  if (f == NULL)
-  {
-    lock_release(&filesys_lock);
-    return -1;
-  }
+  /* [핵심] 커널 버퍼 할당 */
+  void *kbuffer = malloc(size);
+  if (kbuffer == NULL) return -1;
 
-  int bytes_read = file_read(f, buffer, size);
+  /* [핵심] 락 잡고 -> 커널 버퍼에 읽기 -> 락 해제 */
+  lock_acquire(&filesys_lock);
+  int bytes_read = file_read(f, kbuffer, size);
   lock_release(&filesys_lock);
+
+  /* [핵심] 유저 버퍼로 복사 (여기서 Page Fault 나도 락 없음 -> OK) */
+  memcpy(buffer, kbuffer, bytes_read);
+  free(kbuffer);
+
   return bytes_read;
 }
 
+/* [수정됨] Write 구현 */
 int sys_write (int fd, const void *buffer, unsigned size)
 {
-  validate_readable_buffer(buffer, size);
-  lock_acquire(&filesys_lock);
+  if (!is_user_vaddr(buffer) || !is_user_vaddr(buffer + size)) return -1;
+  if (fd == 0) return -1; // STDIN 쓰기 불가
 
-  // Write to STDOUT (console)
-  if (fd == 1)
-  {
+  /* STDOUT 처리 */
+  if (fd == 1) {
     putbuf(buffer, size);
-    lock_release(&filesys_lock);
     return size;
   }
 
-  // Cannot write to STDIN
-  if (fd == 0)
-  {
-    lock_release(&filesys_lock);
-    return -1;
-  }
-  
-  if (fd < 2 || fd >= 128)
-  {
-    lock_release(&filesys_lock);
-    return -1;
-  }
-
   struct thread *t = thread_current();
+  if (fd < 2 || fd >= 128) return -1;
   struct file *f = t->fd[fd];
+  if (f == NULL) return -1;
 
-  if (f == NULL)
-  {
-    lock_release(&filesys_lock);
-    return -1;
-  }
+  void *kbuffer = malloc(size);
+  if (kbuffer == NULL) return -1;
+  memcpy(kbuffer, buffer, size);
 
-  int bytes_written = file_write(f, buffer, size);
+  lock_acquire(&filesys_lock);
+  int bytes_written = file_write(f, kbuffer, size);
   lock_release(&filesys_lock);
+
+  free(kbuffer);
   return bytes_written;
 }
 
+/* [수정됨] Exec 구현 */
+pid_t sys_exec (const char *cmd_line)
+{
+  if (!is_user_vaddr(cmd_line)) return -1;
+  
+  /* 락 생략, process_execute가 처리 */
+  return process_execute (cmd_line);
+}
 void sys_seek (int fd, unsigned position)
 {
   if (fd < 2 || fd >= 128) return;
@@ -277,19 +261,15 @@ unsigned sys_tell (int fd)
   return position;
 }
 
-void sys_close (int fd)
-{
-  if (fd < 2 || fd >= 128) sys_exit(-1);
-
-  struct thread *t = thread_current();
-  struct file *f = t->fd[fd];
-
-  if (f == NULL) sys_exit(-1);
-
-  lock_acquire(&filesys_lock);
-  file_close(f);
-  t->fd[fd] = NULL; // Mark the file descriptor as available.
-  lock_release(&filesys_lock);
+void sys_close(int fd) {
+    if (fd < 2 || fd >= 128) return;
+    struct thread *t = thread_current();
+    if (t->fd[fd] == NULL) return;
+    
+    lock_acquire(&filesys_lock);
+    file_close(t->fd[fd]);
+    t->fd[fd] = NULL;
+    lock_release(&filesys_lock);
 }
 /*================*/
 

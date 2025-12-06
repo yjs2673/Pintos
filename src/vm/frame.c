@@ -14,20 +14,21 @@ struct list_elem *frame_clock;
 struct lock frame_lock;
 struct list frame_list;
 
-bool load_file_to_page(void *kaddr, struct pt_entry *pte) {
-    size_t bytes_read;
+bool 
+load_file_to_page(void *kaddr, struct pt_entry *pte) 
+{
+    lock_acquire(&filesys_lock);
+    
+    size_t bytes_read = file_read_at(pte->file, kaddr, pte->read_bytes, pte->offset);
+    
+    lock_release(&filesys_lock);
 
-    bytes_read = file_read_at(pte->file, kaddr, pte->read_bytes, pte->offset);
-
-    if (bytes_read != pte->read_bytes) {
-        return false; // 파일 읽기 실패
-    }
+    if (bytes_read != pte->read_bytes) return false;
     
     if(pte->zero_bytes > 0){
         memset(kaddr + pte->read_bytes, 0, pte->zero_bytes);
     }
-
-    return true; // 성공
+    return true; 
 }
 
 static struct frame *
