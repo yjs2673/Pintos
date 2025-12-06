@@ -8,6 +8,7 @@
 #include "userprog/gdt.h"
 #include "userprog/pagedir.h"
 #include "userprog/tss.h"
+#include "userprog/syscall.h"
 #include "filesys/directory.h"
 #include "filesys/file.h"
 #include "filesys/filesys.h"
@@ -17,6 +18,9 @@
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "threads/malloc.h"
+#include "vm/frame.h"
+#include "vm/swap.h"
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
@@ -46,31 +50,31 @@ process_execute (const char *file_name)
   char *fn_copy;
   tid_t tid;
 
-  /* Make a copy of FILE_NAME.
-     Otherwise there's a race between the caller and load(). */
+  /* Make a copy of FILE_NAME. */
   fn_copy = palloc_get_page (0);
   if (fn_copy == NULL)
     return TID_ERROR;
   strlcpy (fn_copy, file_name, PGSIZE);
 
-  /* arg[0]만 가져와서 thread 돌리기 */
-  char process_name[128];
-  int idx = 0;
-  while (1)
-  {
-    if (file_name[idx] == ' ')
-    {
-      process_name[idx] = '\0';
-      break;
-    }
-    process_name[idx] = file_name[idx];
-    idx++;
+  /* 파싱하여 첫 번째 토큰(프로그램 이름)만 추출 */
+  char *save_ptr;
+  char *cmd_name_copy = malloc(strlen(file_name) + 1);
+  if (cmd_name_copy == NULL) {
+      palloc_free_page(fn_copy);
+      return TID_ERROR;
   }
-  if(filesys_open(process_name) == NULL) return TID_ERROR;
+  strlcpy(cmd_name_copy, file_name, strlen(file_name) + 1);
+  char *cmd_name = strtok_r(cmd_name_copy, " ", &save_ptr);
+
+  /* [FIX] filesys_open 제거: Lock 문제 및 리소스 누수 방지 
+     파일 존재 여부는 thread_create -> start_process -> load 에서 확인 후
+     실패 시 tid를 반환하지 않는 방식으로 처리됨. */
 
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (process_name, PRI_DEFAULT, start_process, fn_copy);
+  tid = thread_create (cmd_name, PRI_DEFAULT, start_process, fn_copy);
   
+  free(cmd_name_copy); // malloc한 메모리 해제
+
   if (tid == TID_ERROR) 
   {
     palloc_free_page (fn_copy);
@@ -81,13 +85,14 @@ process_execute (const char *file_name)
   struct thread *child = get_child_process(tid);
   if (child == NULL) return TID_ERROR;
 
-  sema_down(&child->lock_load);       // 자식이 신호를 줄 때까지 대기
+  sema_down(&child->lock_load);       // 자식이 로드 완료 신호를 줄 때까지 대기
 
   /* 자식의 로드 성공 여부 확인 */
   if (!child->load_success)
   {
-    list_remove(&child->child_elem);  // 실패한 자식은 리스트에서 제거
-    return TID_ERROR;
+    // 이미 child는 load 실패로 죽어가고 있음. 리스트에서만 제거.
+    list_remove(&child->child_elem);  
+    return TID_ERROR; // -1 반환
   }
 
   return tid;
@@ -103,6 +108,7 @@ start_process (void *file_name_)
   bool success;
 
   struct thread *cur = thread_current();
+  pt_init(&cur->pt);
 
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
@@ -188,6 +194,8 @@ process_exit (void)
     file_allow_write(cur->exec_file);
     file_close(cur->exec_file);
   }
+
+  pt_destroy(&cur->pt);
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
@@ -551,38 +559,37 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
   ASSERT (pg_ofs (upage) == 0);
   ASSERT (ofs % PGSIZE == 0);
 
-  file_seek (file, ofs);
+  // file_seek는 여기서 하지 않고 load_file_to_page 수행 시점에 offset을 이용해 읽음
+
   while (read_bytes > 0 || zero_bytes > 0) 
     {
-      /* Calculate how to fill this page.
-         We will read PAGE_READ_BYTES bytes from FILE
-         and zero the final PAGE_ZERO_BYTES bytes. */
       size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
       size_t page_zero_bytes = PGSIZE - page_read_bytes;
 
-      /* Get a page of memory. */
-      uint8_t *kpage = palloc_get_page (PAL_USER);
-      if (kpage == NULL)
-        return false;
+      struct pt_entry *ve = (struct pt_entry *)malloc(sizeof(struct pt_entry));
+      if(ve == NULL) return false;
+      
+      ve->type = BINARY;
+      ve->vaddr = upage;
+      ve->read_bytes = page_read_bytes;
+      ve->zero_bytes = page_zero_bytes;
+      
+      /* [FIX] file_reopen의 반환값 체크 추가 */
+      ve->file = file_reopen(file); 
+      if (ve->file == NULL) {
+          free(ve);
+          return false;
+      }
+      
+      ve->offset = ofs;
+      ve->is_loaded = false;
+      ve->writable = writable;
+      
+      pt_insert_entry(&thread_current()->pt, ve);
 
-      /* Load this page. */
-      if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
-        {
-          palloc_free_page (kpage);
-          return false; 
-        }
-      memset (kpage + page_read_bytes, 0, page_zero_bytes);
-
-      /* Add the page to the process's address space. */
-      if (!install_page (upage, kpage, writable)) 
-        {
-          palloc_free_page (kpage);
-          return false; 
-        }
-
-      /* Advance. */
       read_bytes -= page_read_bytes;
       zero_bytes -= page_zero_bytes;
+      ofs += page_read_bytes;
       upage += PGSIZE;
     }
   return true;
@@ -593,18 +600,35 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 static bool
 setup_stack (void **esp) 
 {
-  uint8_t *kpage;
+  struct frame *kpage;
   bool success = false;
 
-  kpage = palloc_get_page (PAL_USER | PAL_ZERO);
+  kpage = alloc_page (PAL_USER | PAL_ZERO);
+  
   if (kpage != NULL) 
-    {
-      success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
-      if (success)
-        *esp = PHYS_BASE;
-      else
-        palloc_free_page (kpage);
+  {
+    success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage->kaddr, true);
+    if(!success) {
+      free_page (kpage->kaddr);
+      return success;
     }
+    struct pt_entry *ve = (struct pt_entry *)malloc(sizeof(struct pt_entry));
+    if(ve == NULL) return false;
+
+    *esp = PHYS_BASE;
+    ve->type = SWAPPED;
+    ve->vaddr = (uint8_t *)PHYS_BASE - PGSIZE;
+    ve->read_bytes = 0;
+    ve->zero_bytes = 0;  
+    ve->file = NULL;
+    ve->offset = 0;
+    ve->is_loaded = true;
+    ve->writable = true;
+    kpage->pte = ve;
+      
+    success = !pt_insert_entry (&(thread_current ()->pt), kpage->pte);
+  }
+
   return success;
 }
 
@@ -626,4 +650,78 @@ install_page (void *upage, void *kpage, bool writable)
      address, then map our page there. */
   return (pagedir_get_page (t->pagedir, upage) == NULL
           && pagedir_set_page (t->pagedir, upage, kpage, writable));
+}
+
+bool//완
+handle_mm_fault (struct pt_entry *pte)
+{
+  struct frame *frm = alloc_page(PAL_USER);
+  bool success = false;
+
+  if(frm == NULL)
+    return false; // alloc_page 실패 시 false 반환
+
+  frm->pte = pte;
+  if (pte->type == BINARY) {
+    if (!load_file_to_page(frm->kaddr, pte)) {
+      free_page(frm->kaddr);
+      free(frm); // load_file_to_page 실패 시 frm 해제
+      return false;
+    }
+  } else if (pte->type == SWAPPED) {
+      swap_in(pte->swap_slot, frm->kaddr);
+  }
+
+   success = install_page(pte->vaddr, frm->kaddr, pte->writable);
+   if (!success) {
+      free_page(frm->kaddr);
+      free(frm);
+      return false;
+    }
+    pte->is_loaded=true;
+    return success;
+}
+
+bool
+stack_growth (void *addr, void *esp)//완
+{
+  void *upage;
+  struct frame *kpage;
+  bool success = false;
+
+  //에러체크  
+  if (!is_user_vaddr (addr)) return false;
+  if (addr < (PHYS_BASE - 0x8000000)) return false;//wait-killed
+  if (addr < (esp - 32)) return false;//pt_bad_read
+
+  
+  //get upage 
+  upage = pg_round_down (addr);
+
+  kpage = alloc_page (PAL_USER | PAL_ZERO);
+  if(kpage != NULL)
+    {
+      success = install_page (upage, kpage->kaddr, true);
+      if(!success){
+        free_page (kpage->kaddr);
+        return success;
+      }
+
+      kpage->pte = (struct pt_entry *)malloc(sizeof(struct pt_entry));
+      if(kpage->pte == NULL) return false;
+
+      kpage->pte->type = SWAPPED;
+      kpage->pte->vaddr = upage;
+      kpage->pte->read_bytes = 0;
+      kpage->pte->zero_bytes = 0;
+      kpage->pte->file = NULL;
+      kpage->pte->offset = 0;
+      kpage->pte->is_loaded = true;
+      kpage->pte->writable = true;
+
+      success = !pt_insert_entry (&(thread_current ()->pt), kpage->pte);
+    }
+
+  return success; 
+
 }
