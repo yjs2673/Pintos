@@ -5,7 +5,10 @@
 #include "threads/interrupt.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
-#include "syscall.h"
+#include "userprog/process.h"
+#include "vm/frame.h"
+#include "vm/page.h"
+#include "vm/swap.h"
 
 /* Number of page faults processed. */
 static long long page_fault_cnt;
@@ -149,18 +152,33 @@ page_fault (struct intr_frame *f)
   not_present = (f->error_code & PF_P) == 0;
   write = (f->error_code & PF_W) != 0;
   user = (f->error_code & PF_U) != 0;
+  
+  /* 1. 커널 주소 접근이거나, NULL 포인터 접근인 경우 즉시 종료 */
+  if (is_kernel_vaddr(fault_addr) || fault_addr == NULL) {
+      sys_exit(-1);
+  }
 
-  /* vaddr가 kernel에 위치하는지 검사 */
-  if (is_kernel_vaddr(fault_addr) || user == NULL || not_present) sys_exit(-1);
+  /* 2. 페이지가 존재하는데(P=1) Fault가 났다면 권한 위반(Read-only에 Write 시도) */
+  /* pt-write-code2 테스트가 여기서 통과(종료)됩니다. */
+  if (!not_present) {
+      sys_exit(-1);
+  }
 
-  /* To implement virtual memory, delete the rest of the function
-     body, and replace it with code that brings in the page to
-     which fault_addr refers. */
-  printf ("Page fault at %p: %s error %s page in %s context.\n",
-          fault_addr,
-          not_present ? "not present" : "rights violation",
-          write ? "writing" : "reading",
-          user ? "user" : "kernel");
-  kill (f);
+  /* 3. Supplemental Page Table에서 검색 */
+  struct pt_entry *pte = pt_find_entry (fault_addr);
+  
+  if (pte != NULL) {
+      /* Lazy Loading 수행 */
+      if (!handle_mm_fault (pte)) {
+          sys_exit (-1);
+      }
+  } 
+  else {
+      /* 4. 스택 확장 검사 */
+      /* 스택 포인터 유효 범위 내인지 확인 */
+      if (!stack_growth (fault_addr, f->esp)) {
+          sys_exit (-1);
+      }
+  }
 }
 
