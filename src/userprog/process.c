@@ -624,7 +624,7 @@ setup_stack (void **esp)
 {
   struct frame *kpage;
   
-  kpage = alloc_page (PAL_USER | PAL_ZERO);
+  kpage = vm_alloc_page (PAL_USER | PAL_ZERO);
   
   /* 메모리 할당 실패 시 즉시 리턴 */
   if (kpage == NULL) return false;
@@ -634,7 +634,7 @@ setup_stack (void **esp)
   /* 페이지 설치 시도 */
   if (!install_page (stack_base, kpage->kaddr, true)) 
   {
-    free_page (kpage->kaddr);
+    vm_free_page (kpage->kaddr);
     return false;
   }
 
@@ -682,7 +682,7 @@ handle_mm_fault (struct pt_entry *pte)
 {
   if (pte == NULL) return false;
 
-  struct frame *frm = alloc_page(PAL_USER);
+  struct frame *frm = vm_alloc_page(PAL_USER);
   if (frm == NULL) return false;
 
   frm->pte = pte;
@@ -715,7 +715,7 @@ handle_mm_fault (struct pt_entry *pte)
   return true;
 
 error_cleanup:
-  free_page(frm->kaddr);
+  vm_free_page(frm->kaddr);
   free(frm);
   return false;
 }
@@ -730,13 +730,13 @@ stack_growth (void *addr, void *esp)
   if (!is_valid) return false;
 
   void *upage = pg_round_down (addr);
-  struct frame *kpage = alloc_page (PAL_USER | PAL_ZERO);
+  struct frame *kpage = vm_alloc_page (PAL_USER | PAL_ZERO);
 
   if (kpage == NULL) return false;
 
   /* 설치 먼저 시도 */
   if (!install_page (upage, kpage->kaddr, true)) {
-      free_page (kpage->kaddr);
+      vm_free_page (kpage->kaddr);
       return false;
   }
 
