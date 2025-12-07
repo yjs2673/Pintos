@@ -11,161 +11,176 @@
 #include <stdio.h>
 
 struct list_elem *frame_clock;
-struct lock frame_lock;
 struct list frame_list;
+struct lock frame_lock;
 
-bool 
-load_file_to_page(void *kaddr, struct pt_entry *pte) 
-{
-    lock_acquire(&filesys_lock);
-    
-    size_t bytes_read = file_read_at(pte->file, kaddr, pte->read_bytes, pte->offset);
-    
-    lock_release(&filesys_lock);
-
-    if (bytes_read != pte->read_bytes) return false;
-    
-    if(pte->zero_bytes > 0){
-        memset(kaddr + pte->read_bytes, 0, pte->zero_bytes);
-    }
-    return true; 
-}
-
-static struct frame *
-ft_find_frame(void *kaddr) {
-    struct frame *frm;
-    struct list_elem *elem;
-
-    for (elem = list_begin(&frame_list); elem != list_end(&frame_list); elem = list_next(elem)) {
-        frm = list_entry(elem, struct frame, frame_elem);
-         if (frm->kaddr == kaddr) {
-            return frm; // 일치하는 frame을 찾으면 반환
-        }
-    }
-    
-    return NULL; // 찾지 못하면 NULL 반환
-}
-
-void
-frame_init (void)
-{
+void frame_init (void){
   frame_clock = NULL;
   list_init (&frame_list);
   lock_init (&frame_lock);
 }
 
-struct frame *alloc_page (enum palloc_flags flags)
-{
-  /* [FIX] PAL_USER 플래그가 포함되어야 함 */
-    if (!(flags & PAL_USER)) flags |= PAL_USER;
+struct list_elem* vm_frame_next () {
+  if (list_empty (&frame_list)) return frame_clock;
 
-    uint8_t *p_page = palloc_get_page(flags);
+  struct list_elem *next_elem;
+  bool reset_clock = (frame_clock == NULL || frame_clock == list_end (&frame_list));
+
+  if (reset_clock) next_elem = list_begin (&frame_list);
+  else next_elem = list_next (frame_clock); // 유효하다면 다음 칸으로 이동
+
+  if (next_elem == list_end (&frame_list)) return list_begin (&frame_list);
+
+  return next_elem;
+}
+
+static struct frame* vm_find_frame (void *kaddr) {
+  struct list_elem *e = list_begin (&frame_list);
+
+  while (true) {
+    if (e == list_end (&frame_list)) break;
+
+    struct frame *current_frame = list_entry (e, struct frame, frame_elem);
     
-    while(p_page == NULL){
-        ft_second_chance ();
-        p_page = palloc_get_page(flags);
-    }
+    if (current_frame->kaddr == kaddr) return current_frame; // 주소 비교
 
-    struct frame *frm = malloc(sizeof(struct frame));
-    if (frm == NULL) {
-        palloc_free_page(p_page);
-        return NULL;
-    }
-
-    frm->thread = thread_current();
-    frm->kaddr = p_page;
-    frm->pte = NULL; /* 초기화 */
-
-    ft_insert_frame (frm);
-    return frm;
+    e = list_next (e);
+  }
+    
+  return NULL;
 }
 
-void 
-free_page (void *kaddr)//완
-{
-  struct frame *frm = NULL;
+static void vm_insert_frame (struct frame *frame) {
+  struct list *target_list = &frame_list;
+  struct lock *target_lock = &frame_lock;
 
-    frm = ft_find_frame(kaddr);
-    if(frm!=NULL){
-        if(frm->pte != NULL) pagedir_clear_page (frm->thread->pagedir, frm->pte->vaddr);
-        ft_delete_frame(frm);
-        palloc_free_page(frm->kaddr);
-        free(frm);
-    }
+  lock_acquire (target_lock);
+  list_push_back (target_list, &(frame->frame_elem));
+  lock_release (target_lock);
 }
 
-static void
-ft_insert_frame (struct frame *frame)
-{
-  lock_acquire(&frame_lock);
-  list_push_back (&frame_list, &(frame->frame_elem));
-  lock_release(&frame_lock);
+static void vm_delete_frame (struct frame *frm) {
+  bool is_clock_target = (frame_clock == &frm->frame_elem);
+  frame_clock = is_clock_target ? list_next (frame_clock) : frame_clock;
+  list_remove (&frm->frame_elem);
 }
 
-
-static void
-ft_delete_frame (struct frame *frm)
-{
-  // lock_acquire(&frame_lock);
-  if(frame_clock == &frm->frame_elem)
-        frame_clock = list_next(frame_clock);
-
-    list_remove(&frm->frame_elem);
-  // lock_release(&frame_lock);
-}
-
-
-struct list_elem *frame_next(){//완
-    //원형순회를 위한 next 알고리즘
-    struct list_elem *nxt;
-    if(list_empty(&frame_list)) return frame_clock;
-    if(frame_clock == NULL || frame_clock == list_end(&frame_list)){
-        nxt = list_begin(&frame_list);
-    }
-    else nxt = list_next(frame_clock);
-
-    if(nxt == list_end(&frame_list)) nxt = list_begin(&frame_list);
-
-    return nxt;
-}
-static void
-ft_second_chance (void)
-{
-  frame_clock = frame_next();
+static void vm_second_chance (void) {
+  // 초기화
+  frame_clock = vm_frame_next ();
   lock_acquire (&frame_lock);
-  if (!frame_clock)
-    {
-      lock_release (&frame_lock);
-      return;
-    }
+
+  if (!frame_clock) {
+    lock_release (&frame_lock);
+    return;
+  }
 
   struct frame *victim = list_entry (frame_clock, struct frame, frame_elem);
-    while(victim->pte != NULL && pagedir_is_accessed (victim->thread->pagedir, victim->pte->vaddr)){
-      if(victim->pte!=NULL) pagedir_set_accessed (victim->thread->pagedir, victim->pte->vaddr, 0);
-      frame_clock = frame_next();
-        if(!frame_clock){
-          lock_release (&frame_lock);
-          return;
-        }
-      victim = list_entry (frame_clock, struct frame, frame_elem);
+
+  // Victim 선정
+  while (true) {
+    bool has_pte = (victim->pte != NULL);
+    bool is_accessed = has_pte && pagedir_is_accessed (victim->thread->pagedir, victim->pte->vaddr);
+
+    if (!is_accessed) break; // Accessed 비트가 0이면 루프 탈출 (Victim 선정)
+
+    // Accessed 비트 청소 (1 -> 0)
+    pagedir_set_accessed (victim->thread->pagedir, victim->pte->vaddr, 0);
+
+    // 다음 후보 탐색
+    frame_clock = vm_frame_next ();
+    if (!frame_clock) {
+       lock_release (&frame_lock);
+       return;
     }
-    
-    if(victim->pte!=NULL && victim->pte->type == BINARY){
-       if (pagedir_is_dirty (victim->thread->pagedir, victim->pte->vaddr))
-        {
-          victim->pte->swap_slot = swap_out (victim->kaddr);
-          victim->pte->type = SWAPPED;
-        }
-    }
-  else if(victim->pte!=NULL && victim->pte->type == SWAPPED)
-    {
+    victim = list_entry (frame_clock, struct frame, frame_elem);
+  }
+
+  // 스왑 아웃 여부 결정
+  bool need_swap = false;
+  if (victim->pte != NULL) {
+      bool is_binary_dirty = (victim->pte->type == BINARY) && 
+                              pagedir_is_dirty (victim->thread->pagedir, victim->pte->vaddr);
+      bool is_swapped_type = (victim->pte->type == SWAPPED);
+      
+      need_swap = is_binary_dirty || is_swapped_type;
+  }
+
+  // 스왑 및 정리 수행
+  if (need_swap) {
       victim->pte->swap_slot = swap_out (victim->kaddr);
-    }
-  if(victim->pte) victim->pte->is_loaded = false;
-  if(victim->pte) pagedir_clear_page (victim->thread->pagedir, victim->pte->vaddr);
-  ft_delete_frame (victim);
+      if (victim->pte->type == BINARY) victim->pte->type = SWAPPED;
+  }
+
+  if (victim->pte) {
+      victim->pte->is_loaded = false;
+      pagedir_clear_page (victim->thread->pagedir, victim->pte->vaddr);
+  }
+  
+  vm_delete_frame (victim);
   palloc_free_page (victim->kaddr);
   free (victim);
   lock_release (&frame_lock);
-  return;
+}
+
+bool load_file_to_page (void *kaddr, struct pt_entry *pte)  {
+  lock_acquire (&filesys_lock);
+    
+  size_t bytes_read = file_read_at(pte->file, kaddr, pte->read_bytes, pte->offset);
+    
+  lock_release (&filesys_lock);
+
+  if (bytes_read != pte->read_bytes) return false;
+    
+  if(pte->zero_bytes > 0) memset (kaddr + pte->read_bytes, 0, pte->zero_bytes);
+  
+  return true; 
+}
+
+struct frame* vm_alloc_page (enum palloc_flags flags) {
+  if ((flags & PAL_USER) == 0) flags |= PAL_USER;
+
+  uint8_t *p_page = NULL;
+
+retry_allocation:
+  p_page = palloc_get_page(flags);
+  
+  if (p_page == NULL) {
+    vm_second_chance ();
+    goto retry_allocation;
+  }
+
+  struct frame *frm = malloc (sizeof(struct frame));
+  
+  if (frm == NULL) goto cleanup_and_fail;
+
+  // 정상 초기화
+  frm->thread = thread_current ();
+  frm->kaddr = p_page;
+  frm->pte = NULL;
+
+  vm_insert_frame (frm);
+  return frm;
+
+// 에러 처리 및 자원 해제
+cleanup_and_fail:
+  palloc_free_page (p_page);
+  return NULL;
+}
+
+void vm_free_page (void *kaddr) {
+  struct frame *frm = vm_find_frame (kaddr);
+
+  if (frm != NULL) {
+    struct pt_entry *entry = frm->pte;
+
+    if (entry != NULL) {
+        pagedir_clear_page (frm->thread->pagedir, entry->vaddr);
+    }
+    
+    vm_delete_frame (frm);
+    palloc_free_page (frm->kaddr);
+    free (frm);
+  } 
+  else return;
 }
