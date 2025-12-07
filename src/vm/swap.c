@@ -6,56 +6,62 @@
 
 struct block *swap_block;
 struct lock swap_lock;
-struct bitmap *swap_bitmap;   
+struct bitmap *swap_bitmap;
 
-void handle_block(size_t index, void* kaddr, bool r_w){
-  
-  if(r_w==0)
-    for (size_t i = 0; i < BLOCK_MAX; i++)//4KB = 8*512
-      block_read (swap_block, index * BLOCK_MAX + i, kaddr + BLOCK_SECTOR_SIZE * i);
-  else
-    for (size_t i = 0; i < BLOCK_MAX; i++)//4KB = 8*512
-      block_write (swap_block, index * BLOCK_MAX + i, kaddr + BLOCK_SECTOR_SIZE * i);
-}
-void
-swap_init(void)
-{
-  swap_bitmap = bitmap_create (PGSIZE);
+void swap_init (void) {
   lock_init (&swap_lock);
-  if (swap_bitmap == NULL) PANIC ("swap_init");
+  
+  /* 페이지 크기에 맞게 비트맵 생성 */
+  swap_bitmap = bitmap_create (PGSIZE);
+  
+  if (swap_bitmap == NULL) PANIC ("swap_init: bitmap creation failed");
 }
 
-void
-swap_in (size_t index, void *kaddr)
-{
-  if (index == 0) {
-    PANIC ("swap_in");
-  }
-    lock_acquire (&swap_lock);
-
-    swap_block = block_get_role (BLOCK_SWAP);
-    --index;
-    bitmap_set_multiple (swap_bitmap, index, 1, false);
-
-
-    handle_block(index, kaddr,0);
-
-    lock_release (&swap_lock);
-}
-
-size_t
-swap_out (void *kaddr)
-{
-  size_t index_to_swap;
-
+size_t swap_out (void *kaddr) {
+  size_t slot_idx;
+  
   lock_acquire (&swap_lock);
 
-  index_to_swap = bitmap_scan_and_flip (swap_bitmap, 0, 1, false);
+  /* 빈 슬롯 찾기 */
+  slot_idx = bitmap_scan_and_flip (swap_bitmap, 0, 1, false);
+  
+  if (slot_idx == BITMAP_ERROR) PANIC ("swap_out: no swap slot available");
+
   swap_block = block_get_role (BLOCK_SWAP);
 
-  handle_block(index_to_swap, kaddr,1);
+  size_t i = 0;
+  block_sector_t start_sector = slot_idx * BLOCK_MAX; // BLOCK_MAX = 8
+
+  while (i < BLOCK_MAX) {
+    void *buffer_pos = kaddr + (i * BLOCK_SECTOR_SIZE);
+    block_write (swap_block, start_sector + i, buffer_pos);
+    i++;
+  }
 
   lock_release (&swap_lock);
 
-  return (index_to_swap + 1);
+  return (slot_idx + 1);
+}
+
+void swap_in (size_t index, void *kaddr) {
+  if (index == 0) PANIC ("swap_in: invalid index 0");
+
+  lock_acquire (&swap_lock);
+
+  /* 실제 비트맵 인덱스로 변환 (index - 1) */
+  size_t real_idx = index - 1;
+
+  swap_block = block_get_role (BLOCK_SWAP);
+  
+  /* 비트맵 상태 업데이트 */
+  bitmap_set_multiple (swap_bitmap, real_idx, 1, false);
+
+  for (size_t i = 0; i < BLOCK_MAX; i++) {
+    block_sector_t sec_no = (real_idx * BLOCK_MAX) + i;
+    void *read_addr = kaddr + (i * BLOCK_SECTOR_SIZE);
+      
+    block_read (swap_block, sec_no, read_addr);
+  }
+
+  lock_release (&swap_lock);
 }
