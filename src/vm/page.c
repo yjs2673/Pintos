@@ -5,19 +5,13 @@
 #include "filesys/filesys.h"
 #include "filesys/file.h"
 
-
 /* helper functions */
 static unsigned pt_hash (const struct hash_elem *h_elem, void *UNUSED);
 static bool pt_cmp (const struct hash_elem *left, const struct hash_elem *right, void *UNUSED);
 static void pt_destroy_func (struct hash_elem *h_elem, void *UNUSED);
 
 extern struct lock frame_lock;
-/*
-lock_acquire(&frame_lock);
-lock_release(&frame_lock);
 
-
-*/
 void 
 pt_init (struct hash *pt)//완
 {
@@ -50,7 +44,7 @@ pt_delete_entry (struct hash *pt, struct pt_entry *pte)
   bool success=hash_delete(pt, &(pte->elem));
   lock_release(&frame_lock);
   if (!success) return false;
-  free_page (pagedir_get_page (thread_current ()->pagedir, pte->vaddr));
+  vm_free_page (pagedir_get_page (thread_current ()->pagedir, pte->vaddr));
   free (pte);
   return true;
 }
@@ -88,7 +82,7 @@ pt_cmp (const struct hash_elem *A,
 
 void page_delete(struct pt_entry *pte){//완
     void *paddr = pagedir_get_page(thread_current()->pagedir, pte->vaddr);
-    free_page(paddr); //=frame_free
+    vm_free_page(paddr); //=frame_free
 }
 static void pt_destroy_func(struct hash_elem *e, void *aux UNUSED){//완
     struct pt_entry *ve = hash_entry(e, struct pt_entry, elem);
