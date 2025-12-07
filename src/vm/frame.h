@@ -8,26 +8,26 @@
 
 struct frame 
 { 
-  void *kaddr;                  
-  struct thread *thread;        
-  struct pt_entry *pte;         
-  struct list_elem frame_elem;  
+  void *kaddr;      
+  struct pt_entry *pte;            
+  struct thread *thread;
+  struct list_elem frame_elem;      
 };
+
 extern struct list_elem *frame_clock;
 
 void frame_init (void);
-static void ft_insert_frame (struct frame *frame);
-static void ft_delete_frame (struct frame *frame);
-static struct frame *ft_find_frame (void *kaddr);
-// struct frame* frame_find(void *paddr);
-// static struct frame *ft_get_unaccessed_frame (void);
-static void ft_second_chance (void);
 
-struct frame *alloc_page (enum palloc_flags flags);
-void free_page (void *kaddr);
-bool frame_load_file (void *kaddr, struct pt_entry *pte);
+struct list_elem *vm_frame_next ();
+static struct frame* vm_find_frame (void *kaddr);
 
-// struct frame* frame_alloc(enum palloc_flags flags);
-// void frame_free(void *paddr);
+static void vm_insert_frame (struct frame *frame);
+static void vm_delete_frame (struct frame *frame);
+
+static void vm_second_chance (void);
+
+bool load_file_to_page (void *kaddr, struct pt_entry *pte);
+struct frame *vm_alloc_page (enum palloc_flags flags);
+void vm_free_page (void *kaddr);
 
 #endif
