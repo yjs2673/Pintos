@@ -1,14 +1,13 @@
 #include "userprog/exception.h"
+#include "userprog/process.h"
 #include <inttypes.h>
 #include <stdio.h>
 #include "userprog/gdt.h"
 #include "threads/interrupt.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
-#include "userprog/process.h"
-#include "vm/frame.h"
+#include "syscall.h"
 #include "vm/page.h"
-#include "vm/swap.h"
 
 /* Number of page faults processed. */
 static long long page_fault_cnt;
@@ -127,10 +126,11 @@ kill (struct intr_frame *f)
 static void
 page_fault (struct intr_frame *f) 
 {
-  bool not_present;  /* True: not-present page, false: writing r/o page. */
-  bool write;        /* True: access was write, false: access was read. */
-  bool user;         /* True: access by user, false: access by kernel. */
-  void *fault_addr;  /* Fault address. */
+  bool not_present;      /* True: not-present page, false: writing r/o page. */
+  bool write;            /* True: access was write, false: access was read. */
+  bool user;             /* True: access by user, false: access by kernel. */
+  void *fault_addr;      /* Fault address. */
+  struct pt_entry *pte;  /* If faulting address is from a present page. */
 
   /* Obtain faulting address, the virtual address that was
      accessed to cause the fault.  It may point to code or to
@@ -152,33 +152,32 @@ page_fault (struct intr_frame *f)
   not_present = (f->error_code & PF_P) == 0;
   write = (f->error_code & PF_W) != 0;
   user = (f->error_code & PF_U) != 0;
-  
-  /* 1. 커널 주소 접근이거나, NULL 포인터 접근인 경우 즉시 종료 */
-  if (is_kernel_vaddr(fault_addr) || fault_addr == NULL) {
-      sys_exit(-1);
+
+  /* If the frame of faulting address is present, then 
+     it's an abnormal accessing situation, so terminate! */
+  if (!not_present) 
+    exit (-1);
+
+  /* If not, get the PTE of faulting address, and analyze. */
+  pte = pt_find_entry (fault_addr);
+  /* (1) If it's not a valid reference, then check if it's in
+     a growable region. If yes, expand the user stack. */
+  if (!pte)
+  {
+    if (!expand_stack (fault_addr, f->esp))
+      exit (-1);
+  }
+  /* (2) If it's a valid reference, then get an available frame.
+     'handle_mm_fault' function in process.c will do this. */
+  else
+  {
+    if (!handle_mm_fault (pte))
+      exit (-1);
   }
 
-  /* 2. 페이지가 존재하는데(P=1) Fault가 났다면 권한 위반(Read-only에 Write 시도) */
-  /* pt-write-code2 테스트가 여기서 통과(종료)됩니다. */
-  if (!not_present) {
-      sys_exit(-1);
-  }
-
-  /* 3. Supplemental Page Table에서 검색 */
-  struct pt_entry *pte = pt_find_entry (fault_addr);
-  
-  if (pte != NULL) {
-      /* Lazy Loading 수행 */
-      if (!handle_mm_fault (pte)) {
-          sys_exit (-1);
-      }
-  } 
-  else {
-      /* 4. 스택 확장 검사 */
-      /* 스택 포인터 유효 범위 내인지 확인 */
-      if (!stack_growth (fault_addr, f->esp)) {
-          sys_exit (-1);
-      }
-  }
+  /* As you can see a flow above, any unexpected condition will 
+     be treated as a 'segmentation fault' situation. (exit(-1)) 
+     And, if there's no segmentation/protection fault, that is,
+     if it is the (1) stack-growth situation or (2) page fault
+     situation, then the system will restart the process. */
 }
-

@@ -13,6 +13,7 @@
 #include "threads/vaddr.h"
 #ifdef USERPROG
 #include "userprog/process.h"
+#include "filesys/file.h"
 #endif
 
 /* Random value for struct thread's `magic' member.
@@ -452,40 +453,47 @@ static void
 init_thread (struct thread *t, const char *name, int priority)
 {
   enum intr_level old_level;
-
+  int i;
+  
   ASSERT (t != NULL);
   ASSERT (PRI_MIN <= priority && priority <= PRI_MAX);
   ASSERT (name != NULL);
 
   memset (t, 0, sizeof *t);
-  t->status = THREAD_BLOCKED;
+
+  /* 1. Basic initialization order shuffled */
+  t->magic = THREAD_MAGIC;            /* Set magic first */
+  t->stack = (uint8_t *) t + PGSIZE;  /* Set stack pointer */
+  t->priority = priority;             /* Set priority */
+  t->status = THREAD_BLOCKED;         /* Set status */
   strlcpy (t->name, name, sizeof t->name);
-  t->stack = (uint8_t *) t + PGSIZE;
-  t->priority = priority;
-  t->magic = THREAD_MAGIC;
 
   old_level = intr_disable ();
-  list_push_back (&all_list, &t->allelem);
-  intr_set_level (old_level);
 
-/* User Program 2*/
 #ifdef USERPROG
-  sema_init(&(t->lock_load), 0);
-  sema_init(&(t->lock_child), 0);
-  sema_init(&(t->lock_parent), 0);
-  list_init(&t->child_list);
-  t->exit_status = -1;
-  t->exec_file = NULL;
-  t->load_success = false;
-  list_push_back(&(running_thread()->child_list), &(t->child_elem));
+  /* 2. Initialize Lists & Tables first (Moved up) */
+  list_init (&(t->child_list));
+  list_init (&(t->mm_list));
+  t->mm_list_size = 1;
 
-  #ifdef VM
-  /* VM will be initialized later in load() after malloc is ready */
-  list_init(&t->mmap_list);
-  t->next_mapid = 1;
-  #endif
+  /* Initialize FD table */
+  for (i = 0; i < FD_MAX; i++) 
+    t->fd[i] = NULL;
 
+  /* 3. Initialize Semaphores (Order shuffled) */
+  sema_init (&(t->parent_lock), 0);
+  sema_init (&(t->child_lock), 0);
+  sema_init (&(t->load_lock), 0);
+
+  /* 4. Setup Parent-Child Relationship */
+  t->parent = running_thread ();
+  list_push_back (&(t->parent->child_list), &(t->child_elem));
 #endif
+
+  /* 5. Add to global list at the end of critical section */
+  list_push_back (&all_list, &t->allelem);
+
+  intr_set_level (old_level);
 }
 
 /* Allocates a SIZE-byte frame at the top of thread T's stack and

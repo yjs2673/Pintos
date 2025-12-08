@@ -192,8 +192,16 @@ lock_init (struct lock *lock)
 void
 lock_acquire (struct lock *lock)
 {
+  struct thread *t = thread_current ();
   ASSERT (lock != NULL);
   ASSERT (!intr_context ());
+  /* --- 디버깅용 코드 추가 시작 --- 
+  if (lock_held_by_current_thread (lock)) {
+      printf("!!! CRITICAL ERROR: RECURSIVE LOCKING DETECTED !!!\n");
+      printf("Lock Address: %p\n", lock);
+      printf("Current Thread: %s\n", t->name);
+  }
+  --- 디버깅용 코드 추가 끝 --- */
   ASSERT (!lock_held_by_current_thread (lock));
 
   sema_down (&lock->semaphore);

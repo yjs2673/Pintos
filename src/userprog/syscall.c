@@ -1,449 +1,525 @@
 #include "userprog/syscall.h"
-#include <stdio.h>
-#include <stdint.h>
-#include <stddef.h>
+#include "userprog/process.h"
 #include <syscall-nr.h>
+#include <stdio.h>
+#include <string.h>
+#include "devices/shutdown.h"
+#include "devices/input.h"
 #include "threads/interrupt.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
-#include "userprog/pagedir.h"
-#include "userprog/process.h"
-#include "threads/synch.h"
+#include "threads/malloc.h"
 #include "filesys/filesys.h"
-#include "filesys/file.h"
-#include <string.h>
-#include <stdlib.h>
 #include "vm/mmap.h"
-#include "vm/page.h"
-
-typedef int pid_t;
-
-void shutdown_power_off (void);             /* devices/shutdown.h */
-uint8_t input_getc (void);                  /* devices/input.h */
-void putbuf (const char *buffer, size_t n); /* lib/kernel/console.h */
-
+struct lock access_lock;
 static void syscall_handler (struct intr_frame *);
 
-/* Filesystem serialization lock */
-struct lock filesys_lock;
-
-/* 단일 포인터 유효성 검사 */
-static void
-validate_ptr (const void *uaddr)
+/* Initialize the system call handler. That means is should be called
+   in 'threads/init.c' file to make this handler to be attached to
+   the main function of the pintOS. 
+   Meanwhile, note that it intializes a mutex lock 'access_lock', that
+   provides a synchronization among multiple threads who try to access
+   the file system via system calls. You know, this mutex lock is also
+   used in the mmap management and the process management. */
+void
+syscall_init (void) 
 {
-  if (uaddr == NULL || !is_user_vaddr (uaddr))
-    {
-      sys_exit (-1);
-    }
+  lock_init (&access_lock);
+  //printf("DEBUG: access_lock address is %p\n", &access_lock);
+  intr_register_int (0x30, 3, INTR_ON, syscall_handler, "syscall");
 }
 
-/* 버퍼 유효성 검사 함수 */
+
+/* System call handler of this pintOS. It uses the stack pointer to
+   get arguments for each call. Note that it has the system call
+   table to react to users' requests. You can see more detail in the
+   report PDF file of the project 1-2 phase. (especially, in 1) */
 static void
-validate_buffer (const void *buffer, unsigned size, bool to_write)
+syscall_handler (struct intr_frame *f UNUSED) 
 {
-  if (size == 0)
-    return;
-
-  if (buffer == NULL)
-    sys_exit (-1);
-
-  const uint8_t *addr = buffer;
-  unsigned offset = 0;
-
-  while (offset < size)
-    {
-      void *ptr = (void *)(addr + offset);
-      
-      if (!is_user_vaddr (ptr))
-        sys_exit (-1);
-
-      struct pt_entry *vme = pt_find_entry (ptr);
-      
-      if (vme != NULL)
-        {
-          if (to_write && !vme->writable)
-            sys_exit (-1);
-        }
-      else
-        {
-           /* Unmapped memory check (simple) */
-           if (pagedir_get_page (thread_current ()->pagedir, ptr) == NULL)
-             {
-               // 필요시 추가 로직 (스택 확장 등)
-             }
-        }
-
-      unsigned page_left = PGSIZE - pg_ofs (ptr);
-      unsigned advance = page_left < (size - offset) ? page_left : (size - offset);
-      offset += advance;
-    }
-    
-    void *end_ptr = (void *)(addr + size - 1);
-    if (!is_user_vaddr(end_ptr)) sys_exit(-1);
-    
-    if (to_write) {
-        struct pt_entry *vme = pt_find_entry(end_ptr);
-        if (vme != NULL && !vme->writable) sys_exit(-1);
-    }
-}
-
-/* 문자열 유효성 검사 */
-static void
-validate_cstr (const char *str)
-{
-  if (str == NULL) sys_exit(-1);
-  validate_ptr (str);
+  uint32_t *esp = f->esp;
+  uint32_t sys_num = *esp;
   
-  while (*str != '\0')
-    {
-      str++;
-      if (pg_ofs(str) == 0)
-        validate_ptr(str);
+  /* System Call Table: Call a corresponding routine
+     to perform system function requested by user program. */
+  switch (sys_num)
+  {
+  case SYS_HALT:        /* Halt the operating system. */
+      halt ();
+      break;
+
+  case SYS_EXIT:        /* Terminate the process. */
+      USER_ADDR_CHECK(1, esp);
+      exit (ARG(1, int));
+      break;
+
+  case SYS_EXEC:        /* Start another process. */
+      USER_ADDR_CHECK(1, esp);
+      f->eax = exec (ARG(1, char *));
+      break;
+
+  case SYS_WAIT:        /* Wait for a child process to die. */
+      USER_ADDR_CHECK(1, esp);
+      f->eax = wait (ARG(1, pid_t));
+      break;
+
+  case SYS_CREATE:      /* Create a file. */
+      USER_ADDR_CHECK(2, esp);
+      f->eax = create (ARG(1, char *), ARG(2, unsigned));
+      break;
+
+  case SYS_REMOVE:      /* Delete a file. */
+      USER_ADDR_CHECK(1, esp);
+      f->eax = remove (ARG(1, char *));
+      break;
+
+  case SYS_OPEN:        /* Open a file. */
+      USER_ADDR_CHECK(1, esp);
+      f->eax = open (ARG(1, char *));
+      break;
+
+  case SYS_FILESIZE:    /* Obtain a file's size. */
+      USER_ADDR_CHECK(1, esp);
+      f->eax = filesize (ARG(1, int));
+      break;
+
+  case SYS_READ:        /* Read from a file. */
+      USER_ADDR_CHECK(3, esp);
+      f->eax = read (ARG(1, int), ARG(2, void *), ARG(3, unsigned));
+      break;
+
+  case SYS_WRITE:       /* Write to a file. */
+      USER_ADDR_CHECK(3, esp);
+      f->eax = write (ARG(1, int), ARG(2, void *), ARG(3, unsigned));
+      break;
+
+  case SYS_SEEK:        /* Change position in a file. */
+      USER_ADDR_CHECK(2, esp);
+      seek (ARG(1, int), ARG(2, unsigned));
+      break;
+
+  case SYS_TELL:        /* Report current position in a file. */
+      USER_ADDR_CHECK(1, esp);
+      f->eax = tell (ARG(1, int));
+      break;
+
+  case SYS_CLOSE:       /* Close a file. */
+      USER_ADDR_CHECK(1, esp);
+      close (ARG(1, int));
+      break;
+
+  case SYS_FIBONACCI:   /* Calculate the N-th fibonacci number. */
+      USER_ADDR_CHECK(1, esp);
+      f->eax = fibonacci (ARG(1, int));
+      break;
+
+  case SYS_MAXOFFOUR:   /* Calculate the maximum among four integers. */
+      USER_ADDR_CHECK(4, esp);
+      f->eax = max_of_four_int (ARG(1, int), ARG(2, int), ARG(3, int), ARG(4, int));
+      break;
+  
+  case SYS_MMAP:        /* Map a file into memory. */
+      USER_ADDR_CHECK(2, esp);
+      f->eax = mmap (ARG(1, int), ARG(2, void *));
+      break;
+
+  case SYS_MUNMAP:      /* Remove a memory mapping. */
+      USER_ADDR_CHECK(1, esp);
+      munmap (ARG(1, mapid_t));
+      break;
+
+  default: break;
+  }
+}
+
+void check_user_buffer(const void *buffer, unsigned size, bool to_write) {
+    if (buffer == NULL) exit(-1);
+    
+    char *ptr = (char *)buffer;
+    for (unsigned i = 0; i < size; i += 4096) { 
+        void *addr = ptr + i;
+        POINTER_CHECK(addr); 
+        
+        // 락 잡기 전에 미리 찔러서 Page Fault 처리!
+        if (to_write) {
+             volatile char c = *(char *)addr; 
+        } else {
+             *(char *)addr = *(char *)addr; 
+        }
     }
+    POINTER_CHECK(ptr + size - 1);
+    if (to_write) { volatile char c = *(ptr + size - 1); }
+    else { *(ptr + size - 1) = *(ptr + size - 1); }
 }
 
-static int32_t
-get_user_int (const void *uaddr)
-{
-  validate_ptr (uaddr);
-  validate_ptr (uaddr + 3); 
-  return *(const int32_t *) uaddr;
-}
-
-/* syscall function definitions */
-/*============================================*/
-void sys_halt (void)
+/* Halt routine: it terminates the pintOS via shutdown func. */
+void 
+halt (void) 
 {
   shutdown_power_off ();
 }
 
-void sys_exit (int status)
+/* Exit routine: stores an exit status of running thread, with closing all 
+   the not-closed files in the FDT. After that, reaps every child process 
+   that this current process forked and calls 'thread_exit' to do the main 
+   thread-clearing job. */
+void 
+exit (int status) 
 {
-  struct thread *t = thread_current ();
-  t->exit_status = status;
-  printf ("%s: exit(%d)\n", t->name, status);
+  struct file **f_list;
+  struct list *c_list;
+  struct list_elem *iter;
+  int i;
+
+  printf("%s: exit(%d)\n", thread_name (), status);
+  thread_current ()->exit_status = status;
+  
+  /* Close all the not-closed files in the FDT. */
+  f_list = &(thread_current ()->fd);
+  for (i = 0; i < FD_MAX; i++)
+   {
+     if (f_list[i] != NULL)
+       close (i);
+   }
+
+  /* Reap every child process that this(parent) process forked. */
+  c_list = &(thread_current ()->child_list);
+  for (iter = list_begin (c_list);
+      iter != list_end (c_list);
+      iter = list_next (iter))
+    wait(list_entry(iter, struct thread, child_elem)->tid);
+    
   thread_exit ();
 }
 
-int sys_wait (pid_t pid)
+/* Exec routine: simply calls 'process_execute'. 
+   'process_execute' will do the main 'execution' job! */
+tid_t 
+exec (const char *cmd_line) 
+{
+  return process_execute (cmd_line);
+}
+
+/* Wait routine: simply calls 'process_wait'. */
+int 
+wait (tid_t pid) 
 {
   return process_wait (pid);
 }
 
-bool sys_create (const char *file, unsigned initial_size)
+/* Create routine: checks the value of pointer variable and simply calls 
+   'filesys_create' func of filesys.h. Note that all the file-related system 
+   calls including this must be synchronized via mutex lock 'access_lock'. */
+bool
+create (const char *file, unsigned initial_size)
 {
-  validate_cstr(file);
-  lock_acquire(&filesys_lock);
-  bool success = filesys_create(file, initial_size);
-  lock_release(&filesys_lock);
+  bool success;
+
+  POINTER_CHECK(file);
+
+  lock_acquire (&access_lock);
+  success = filesys_create (file, initial_size);
+  lock_release (&access_lock);
+
   return success;
 }
 
-bool sys_remove (const char *file)
+/* Remove routine: implemented just like 'create' above. */
+bool
+remove (const char *file)
 {
-  validate_cstr(file);
-  lock_acquire(&filesys_lock);
-  bool success = filesys_remove(file);
-  lock_release(&filesys_lock);
+  bool success;
+
+  POINTER_CHECK(file);
+
+  lock_acquire (&access_lock);
+  success = filesys_remove (file);
+  lock_release (&access_lock);
+
   return success;
 }
 
-int sys_open (const char *file)
+/* Open routine: opens the corresponding file structure of the target file, 
+   with assigning a proper descriptor. We should guarantee two things here.
+    - only one process at a time can access this code. 
+    - if a file is as same as the running program, then deny any write 
+      operations on that file.                                           */
+int
+open (const char *file)
 {
-  validate_cstr(file);
-  lock_acquire(&filesys_lock);
-  struct file *f = filesys_open(file);
+  struct file **fd_list;
+  struct file *f;
+  int i, idx;
+
+  POINTER_CHECK(file);
+  lock_acquire (&access_lock);
+
+  /* Open 'open file table' of the input file. 
+     If open fails, then return with -1 status */
+  f = filesys_open (file);
   if (f == NULL)
-  {
-    lock_release(&filesys_lock);
-    return -1;
-  }
+   {
+     lock_release (&access_lock);
+     return OPEN_FILE_ERROR;
+   }
 
-  struct thread *t = thread_current();
-  /* 수정: fd_table -> fd */
-  for (int i = 2; i < 128; i++)
-  {
-    if (t->fd[i] == NULL) 
-    {
-      t->fd[i] = f;
-      lock_release(&filesys_lock);
-      return i;
-    }
-  }
+  /* If a file is as same as the running program,
+     then deny any write operations on this file */
+  if (!strcmp (thread_name (), file))
+    file_deny_write (f);
 
-  file_close(f);
-  lock_release(&filesys_lock);
-  return -1;
+  /* Assign proper file descriptor to file struct */
+  fd_list = &(thread_current ()->fd);
+  for (i = 3; i < FD_MAX; i++) 
+   {
+     if (fd_list[i] == NULL)
+      {
+        fd_list[i] = f;
+        idx = i;
+        break;
+      }
+   }
+  if (i == FD_MAX)
+  {
+    file_close(f);
+    lock_release (&access_lock);
+    return OPEN_FILE_ERROR;
+  }
+  lock_release (&access_lock);
+
+  return idx;
 }
 
-int sys_filesize (int fd)
+/* Filesize routine: simply calls 'file_length' function. */
+int
+filesize (int fd)
 {
-  if (fd < 2 || fd >= 128) return -1;
-  
-  struct thread *t = thread_current();
-  /* 수정: fd_table -> fd */
-  struct file *f = t->fd[fd];
+  struct file *f;
+  int size;
 
-  if (f == NULL) return -1;
+  lock_acquire (&access_lock);
 
-  lock_acquire(&filesys_lock);
-  int size = file_length(f);
-  lock_release(&filesys_lock);
+  if (fd < 3 || fd >= FD_MAX) exit (-1);
+  f = thread_current ()->fd[fd];
+  if (f == NULL) 
+  {
+    lock_release (&access_lock);
+    exit (-1);
+  }
+  else size = file_length(f);
+
+  lock_release (&access_lock);
+
   return size;
 }
 
-int sys_read (int fd, void *buffer, unsigned size)
+/* Read routine: reads 'size' bytes from the file pointed by fd, and stores 
+   it to buffer. We should guarantee one thing below. (same for the next 
+   'write' routine)
+    - only one process at a time can access this code. */
+int 
+read (int fd, void *buffer, unsigned size)
 {
-  validate_buffer(buffer, size, true);
+  check_user_buffer(buffer, size, true);
+  struct file *f;
+  off_t byte_cnt = 0; 
+  char c; unsigned i;
 
-  if (fd == 1) return -1; // STDOUT
-
-  if (fd == 0) {
-      uint8_t *buf = (uint8_t *)buffer;
-      for (unsigned i = 0; i < size; i++) buf[i] = input_getc();
-      return size;
-  }
-
-  struct thread *t = thread_current();
-  if (fd < 2 || fd >= 128) return -1;
-  /* 수정: fd_table -> fd */
-  struct file *f = t->fd[fd];
-  if (f == NULL) return -1;
-
-  /* 수정: malloc 호출 전 size 0 처리 (read-zero 해결) */
-  if (size == 0) return 0;
-
-  void *kbuffer = malloc(size);
-  if (kbuffer == NULL) return -1;
-
-  lock_acquire(&filesys_lock);
-  int bytes_read = file_read(f, kbuffer, size);
-  lock_release(&filesys_lock);
-
-  memcpy(buffer, kbuffer, bytes_read);
-  free(kbuffer);
-
-  return bytes_read;
-}
-
-int sys_write (int fd, const void *buffer, unsigned size)
-{
-  validate_buffer(buffer, size, false);
-
-  if (fd == 0) return -1; // STDIN
-
-  if (fd == 1) {
-    putbuf(buffer, size);
-    return size;
-  }
-
-  struct thread *t = thread_current();
-  if (fd < 2 || fd >= 128) return -1;
-  /* 수정: fd_table -> fd */
-  struct file *f = t->fd[fd];
-  if (f == NULL) return -1;
-
-  /* 수정: malloc 호출 전 size 0 처리 (write-zero 해결) */
-  if (size == 0) return 0;
-
-  void *kbuffer = malloc(size);
-  if (kbuffer == NULL) return -1;
-  memcpy(kbuffer, buffer, size);
-
-  lock_acquire(&filesys_lock);
-  int bytes_written = file_write(f, kbuffer, size);
-  lock_release(&filesys_lock);
-
-  free(kbuffer);
-  return bytes_written;
-}
-
-pid_t sys_exec (const char *cmd_line)
-{
-  validate_cstr(cmd_line);
-  return process_execute (cmd_line);
-}
-
-/* static으로 변경하여 프로토타입 경고 해결 */
-static void sys_seek (int fd, unsigned position)
-{
-  if (fd < 2 || fd >= 128) return;
-  
-  struct thread *t = thread_current();
-  /* 수정: fd_table -> fd */
-  struct file *f = t->fd[fd];
-
-  if (f == NULL) return;
-
-  lock_acquire(&filesys_lock);
-  file_seek(f, position);
-  lock_release(&filesys_lock);
-}
-
-/* static으로 변경하여 프로토타입 경고 해결 */
-static unsigned sys_tell (int fd)
-{
-  if (fd < 2 || fd >= 128) return 0;
-
-  struct thread *t = thread_current();
-  /* 수정: fd_table -> fd */
-  struct file *f = t->fd[fd];
-
-  if (f == NULL) return 0;
-
-  lock_acquire(&filesys_lock);
-  unsigned position = file_tell(f);
-  lock_release(&filesys_lock);
-  return position;
-}
-
-/* static으로 변경하여 프로토타입 경고 해결 */
-void sys_close(int fd) {
-    if (fd < 2 || fd >= 128) return;
-    struct thread *t = thread_current();
-    /* 수정: fd_table -> fd */
-    if (t->fd[fd] == NULL) return;
+  POINTER_CHECK(buffer);
+  lock_acquire (&access_lock);
     
-    lock_acquire(&filesys_lock);
-    file_close(t->fd[fd]);
-    t->fd[fd] = NULL;
-    lock_release(&filesys_lock);
+  if (fd == 0) 
+   {   /* STDIN_FILENO */
+     for (i = 0; (i < size) && ((c = input_getc()) != '\0'); i++)
+      {
+        *((char*)buffer) = c;
+        buffer = (char*)buffer + 1;
+        byte_cnt++;
+      }
+     *((char*)buffer) = '\0';
+   }
+  else if (fd < 3 || fd >= FD_MAX)
+   {   /* File descriptor error */
+     lock_release (&access_lock);
+     exit (-1);
+   }
+  else 
+   {   /* Any I/O-possible files */
+     f = thread_current ()->fd[fd];
+     if (f == NULL)
+      {
+        lock_release (&access_lock);
+        exit (-1);
+      }
+        
+     byte_cnt = file_read (f, buffer, size);
+   }
+  lock_release (&access_lock);
+
+  return byte_cnt;
 }
 
-/* Additional syscalls */
-int sys_fibonacci (int n)
+/* Write routine: writes 'size' bytes of buffer to the file pointed by fd. 
+   We should guarantee two things here.
+    - only one process at a time can access this code. 
+    - if a file is as same as the running program, then deny any write 
+      operations on that file.                                          */
+int 
+write (int fd, const void *buffer, unsigned size) 
 {
-  if (n < 0 || n > 46) return -1; 
-  int pprev = 0, prev = 1, cur = 0;
-  if (n == 0) return pprev;
-  if (n == 1) return prev;
+  check_user_buffer(buffer, size, true);
+  struct file *f;
+  off_t byte_cnt = 0;
 
-  for (int i = 1; i < n; i++)
-  {
-    cur = prev + pprev;
-    pprev = prev;
-    prev = cur;
-  }
-  return cur;
+  POINTER_CHECK(buffer);
+  lock_acquire (&access_lock);
+
+  if (fd == 1) 
+   {   /* STDOUT_FILENO */
+     putbuf(buffer, size);
+     byte_cnt += size;
+   }
+  else if (fd < 3 || fd >= FD_MAX)
+   {   /* File descriptor error */
+     lock_release (&access_lock);
+     exit (-1);
+   }
+  else 
+   {   /* Any I/O-possible files */
+     f = thread_current ()->fd[fd];
+     if (f == NULL)
+      {
+        lock_release (&access_lock);
+        exit (-1);
+      }
+     if (f->deny_write == true)
+       file_deny_write (f);
+
+     byte_cnt = file_write (f, buffer, size);
+   }
+  lock_release (&access_lock);
+
+  return byte_cnt;
 }
 
-int sys_max_of_four_int (int a, int b, int c, int d)
-{
-  int max1 = a >= b ? a : b;
-  int max2 = c >= d ? c : d;
-  return max1 >= max2 ? max1 : max2;
-}
-
-/*============================================*/
-
+/* Seek routine: simply calls 'file_seek' function. This is implemented 
+   just like the 'filesize' syscall. Same for the 'tell' syscall below. 
+   (The reason why these are implemented simply is that pintOS provides 
+   the complete basic file system with filesys.h) */
 void
-syscall_init (void) 
+seek (int fd, unsigned position)
 {
-  lock_init (&filesys_lock);
-  intr_register_int (0x30, 3, INTR_ON, syscall_handler, "syscall");
+  struct file *f;
+
+  lock_acquire (&access_lock);
+
+  if (fd < 3 || fd >= FD_MAX) exit (-1);
+  f = thread_current ()->fd[fd];
+  if (f == NULL) 
+  {
+    lock_release (&access_lock);
+    exit (-1);
+  }
+
+  file_seek (f, position);
+
+  lock_release (&access_lock);
 }
 
-static void
-syscall_handler (struct intr_frame *f UNUSED) 
+/* Tell routine: simply calls 'file_tell' function. */
+unsigned
+tell (int fd)
 {
-  void *esp = f->esp;
+  struct file *f;
+  unsigned pos;
 
-  validate_ptr (esp);
-  
-  int sysno = get_user_int (esp);
+  lock_acquire (&access_lock);
 
-  uint32_t arg0 = 0, arg1 = 0, arg2 = 0, arg3 = 0;
-  
-  if (sysno == SYS_HALT || sysno == SYS_EXIT || sysno == SYS_EXEC || 
-      sysno == SYS_WAIT || sysno == SYS_CREATE || sysno == SYS_REMOVE ||
-      sysno == SYS_OPEN || sysno == SYS_FILESIZE || sysno == SYS_SEEK ||
-      sysno == SYS_READ || sysno == SYS_WRITE || sysno == SYS_TELL ||
-      sysno == SYS_CLOSE || sysno == SYS_FIBONACCI || sysno == SYS_MAX_OF_FOUR_INT ||
-      sysno == SYS_MMAP || sysno == SYS_MUNMAP)
+  if (fd < 3 || fd >= FD_MAX) exit (-1);
+  f = thread_current ()->fd[fd];
+  if (f == NULL) 
   {
-    if (sysno != SYS_HALT)                
-      arg0 = get_user_int ((uint8_t *) esp + 4);
-    if (sysno == SYS_READ || sysno == SYS_WRITE || sysno == SYS_MAX_OF_FOUR_INT ||
-        sysno == SYS_CREATE || sysno == SYS_SEEK || sysno == SYS_MMAP)
-      arg1 = get_user_int ((uint8_t *) esp + 8);
-    if (sysno == SYS_READ || sysno == SYS_WRITE || sysno == SYS_MAX_OF_FOUR_INT)  
-      arg2 = get_user_int ((uint8_t *) esp + 12);
-    if (sysno == SYS_MAX_OF_FOUR_INT)             
-      arg3 = get_user_int ((uint8_t *) esp + 16);
+    lock_release (&access_lock);
+    exit (-1); 
   }
 
-  switch (sysno)
-  {
-  case SYS_HALT:
-    sys_halt ();
-    break;
+  pos = file_tell(f);
 
-  case SYS_EXIT:
-    sys_exit ((int)arg0);
-    break;
+  lock_release (&access_lock);
 
-  case SYS_EXEC:
-    f->eax = (uint32_t) sys_exec ((const char *) arg0);
-    break;
+  return pos;
+}
 
-  case SYS_WAIT:
-    f->eax = (uint32_t) sys_wait ((pid_t) arg0);
-    break;
+/* Close routine: simply calls 'file_close' function. */
+void
+close (int fd)
+{
+  struct file *f;
 
-  case SYS_CREATE:
-    f->eax = (uint32_t) sys_create ((const char *) arg0, (unsigned) arg1);
-    break;
+  if (fd < 3 || fd >= FD_MAX) exit (-1);
+  f = thread_current ()->fd[fd];
+  if (f == NULL) exit (-1);
 
-  case SYS_REMOVE:
-    f->eax = (uint32_t) sys_remove ((const char *) arg0);
-    break;
+  thread_current ()->fd[fd] = NULL;
 
-  case SYS_OPEN:
-    f->eax = (uint32_t) sys_open ((const char *) arg0);
-    break;
+  file_close (f);
+}
 
-  case SYS_FILESIZE:
-    f->eax = (uint32_t) sys_filesize ((int)arg0);
-    break;
+/* Fibonacci routine: returns N-th value of fibonacci sequence.
+   It produces sequence with simple iterative algorithm. */
+int 
+fibonacci (int n) 
+{
+  int f = 0, f1 = 1, f2 = 0;
+  int i;
 
-  case SYS_READ:
-    f->eax = (uint32_t) sys_read ((int)arg0, (void *) arg1, (unsigned) arg2);
-    break;
+  if (n == 0) return 0;
+  if (n == 1) return 1;
+  for (i = 2; i <= n; i++) 
+   {
+     f = f1 + f2;
+     f2 = f1;
+     f1 = f;
+   }
 
-  case SYS_WRITE:
-    f->eax = (uint32_t) sys_write ((int)arg0, (const void *) arg1, (unsigned) arg2);
-    break;
+  return f;
+}
 
-  case SYS_SEEK:
-    sys_seek ((int)arg0, (unsigned) arg1);
-    break;
+/* Max_of_four_int routine: returns the maximum among arbitrary decimals.
+   It uses simple bubble-sort to figure out the maximum. */
+int 
+max_of_four_int (int a, int b, int c, int d)
+{
+  int arr[4], temp;
+  int i, j;
 
-  case SYS_TELL:
-    f->eax = (uint32_t) sys_tell ((int)arg0);
-    break;
+  arr[0] = a; arr[1] = b; arr[2] = c; arr[3] = d;
+  for (i = 0; i < 3; i++) 
+    for (j = i + 1; j < 4; j++) 
+     {
+       if (arr[i] > arr[j]) 
+        {
+          temp = arr[i];
+          arr[i] = arr[j];
+          arr[j] = temp;
+        }
+     }
 
-  case SYS_CLOSE:
-    sys_close ((int)arg0);
-    break;
+  return arr[3];
+}
 
-  case SYS_FIBONACCI:
-    f->eax = (uint32_t) sys_fibonacci ((int)arg0);
-    break;
+/* Mmap routine: simply calls the function 'mm_mapping' that performs a 
+   memory mapping. Yes, this function is declared in 'vm/mmap.h' file. */
+mapid_t
+mmap (int fd, void *addr)
+{
+  return mm_mapping (fd, addr);
+}
 
-  case SYS_MAX_OF_FOUR_INT:
-    f->eax = (uint32_t) sys_max_of_four_int ((int)arg0, (int)arg1, (int)arg2, (int)arg3);
-    break;
-
-  case SYS_MMAP:
-    f->eax = (uint32_t) mmap ((int)arg0, (void *) arg1);
-    break;
-
-  case SYS_MUNMAP:
-    munmap ((int)arg0);
-    break;
-
-  default:
-    sys_exit (-1);
-    break;
-  }
+/* Munmap routine: simply calls the function 'mm_freeing' just like the
+   mmap() above, and of course, it's declared in 'vm/mmap.h' file. */
+void 
+munmap (mapid_t mapid)
+{
+  mm_freeing (mapid);
 }

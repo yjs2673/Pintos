@@ -3,9 +3,10 @@
 
 #include <debug.h>
 #include <list.h>
+#include <hash.h>
 #include <stdint.h>
-#include "synch.h"
-#include "lib/kernel/hash.h"
+#include <threads/synch.h>
+#include <filesys/file.h>
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -25,6 +26,9 @@ typedef int tid_t;
 #define PRI_MIN 0                       /* Lowest priority. */
 #define PRI_DEFAULT 31                  /* Default priority. */
 #define PRI_MAX 63                      /* Highest priority. */
+
+/* Maximum size of file descriptor table */
+#define FD_MAX 128
 
 /* A kernel thread or user process.
 
@@ -98,23 +102,24 @@ struct thread
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
-    /* User Program 1 */
-    struct list child_list;             /* 자식 스레드 리스트 */
-    struct list_elem child_elem;        /* 자식 스레드 원소 */
-    int exit_status;                    /* 종료 상태 */
-    struct semaphore lock_child;        /* 자식 프로세스용 */
-    struct semaphore lock_parent;       /* 부모 프로세스용 */
-    /* User Program 2 */
-    struct semaphore lock_load;         /* 멀티 스레드용 */
-    struct file* fd[128];               /* file descriptor */
-    struct file* exec_file;             /* 현재 실행 중인 파일 포인터 */
-    bool load_success;                  /* 프로세스 로드 성공 여부 */
-#endif
+    struct semaphore load_lock;         /* Semaphore for implementing exec */
+    struct semaphore parent_lock;       /* Semaphore for implementing wait */
+    struct semaphore child_lock;        /* Sem for suspending memory clear */
+    
+    struct thread *parent;              /* This is a helper for 'load_lock' */
+    struct list child_list;             /* List storing children of process */
+    struct list_elem child_elem;        /* List element declaration */
+    
+    int exit_status;                    /* Exit status of a process */
 
-    /* Virtual Memory */
-    struct hash pt;                     /* Supplemental page table */
-    struct list mmap_list;              /* Memory mapped files */
-    int next_mapid;                     /* Next mmap ID */
+    struct file *fd[FD_MAX];            /* File Descriptor Table */
+    struct file *file;                  /* Mapped file of current thread. */
+
+    struct hash pt;                     /* Supplemental Page Table */
+
+    struct list mm_list;                /* List of loaded-by-mmap files. */
+    unsigned mm_list_size;              /* Number of mmapped files. */
+#endif
 
     /* Owned by thread.c. */
     unsigned magic;                     /* Detects stack overflow. */

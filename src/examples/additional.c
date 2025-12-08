@@ -1,27 +1,41 @@
+/* additional.c
+
+   Prints the result of 'fibonacci' system call to the console, 
+   using arg1 as parameter. 
+   Prints the result of 'max_of_four_int' system call to the console, 
+   using arg1-4 as parameters. */
+
 #include <stdio.h>
-#include <stdlib.h>
-#include "user/syscall.h"
+#include <syscall.h>
 
-int main (int argc, char *argv[])
+static int atoi(const char* str);
+
+int
+main(int argc, char* argv[])
 {
-  if (argc != 2 && argc != 5) 
-  {
-    printf("too less or large arguments to execute additional!\n");
-    return EXIT_SUCCESS;
-  }
+    if (argc != 5)
+    {
+        printf("%s: open failed\n", argv[0]);
+        exit(-1);
+    }
 
-  if (argc == 2) 
-  {
-    int a = atoi(argv[1]);
-    printf("%d\n", fibonacci(a));
-    return EXIT_SUCCESS;
-  }
+    printf("%d %d\n", fibonacci(atoi(argv[1])), max_of_four_int(
+        atoi(argv[1]), atoi(argv[2]), atoi(argv[3]), atoi(argv[4])));
 
-  int a = atoi(argv[1]);
-  int b = atoi(argv[2]);
-  int c = atoi(argv[3]);
-  int d = atoi(argv[4]);
-  printf("%d %d\n", fibonacci(a), max_of_four_int(a, b, c, d));
+    return 0;
+}
 
-  return EXIT_SUCCESS;
+/* My atoi function that produces a number indicated by string */
+int 
+atoi(const char* str)
+{
+    int num = 0, i = 0;
+
+    while (str[i] && (str[i] >= '0' && str[i] <= '9'))
+    {
+        num = num * 10 + (str[i] - '0');
+        i++;
+    }
+
+    return num;
 }
