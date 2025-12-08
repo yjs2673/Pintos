@@ -126,58 +126,43 @@ kill (struct intr_frame *f)
 static void
 page_fault (struct intr_frame *f) 
 {
-  bool not_present;      /* True: not-present page, false: writing r/o page. */
-  bool write;            /* True: access was write, false: access was read. */
-  bool user;             /* True: access by user, false: access by kernel. */
-  void *fault_addr;      /* Fault address. */
-  struct pt_entry *pte;  /* If faulting address is from a present page. */
+  void *fault_addr;
+  struct pt_entry *pte;
+  bool success = false;
 
-  /* Obtain faulting address, the virtual address that was
-     accessed to cause the fault.  It may point to code or to
-     data.  It is not necessarily the address of the instruction
-     that caused the fault (that's f->eip).
-     See [IA32-v2a] "MOV--Move to/from Control Registers" and
-     [IA32-v3a] 5.15 "Interrupt 14--Page Fault Exception
-     (#PF)". */
+  /* Obtain faulting address from CR2 */
   asm ("movl %%cr2, %0" : "=r" (fault_addr));
 
-  /* Turn interrupts back on (they were only off so that we could
-     be assured of reading CR2 before it changed). */
+  /* Enable interrupts immediately */
   intr_enable ();
-
-  /* Count page faults. */
+  
+  /* Update stats (Execution order swapped slightly with intr_enable logic) */
   page_fault_cnt++;
 
-  /* Determine cause. */
-  not_present = (f->error_code & PF_P) == 0;
-  write = (f->error_code & PF_W) != 0;
-  user = (f->error_code & PF_U) != 0;
-
-  /* If the frame of faulting address is present, then 
-     it's an abnormal accessing situation, so terminate! */
-  if (!not_present) 
+  /* 1. Check for Protection Fault first.
+     PF_P bit (0x1) is set if the page is present.
+     If present, it's a permission error (read-only, etc), so we must exit. */
+  if (f->error_code & PF_P)
     exit (-1);
 
-  /* If not, get the PTE of faulting address, and analyze. */
+  /* 2. Retrieve the Page Table Entry */
   pte = pt_find_entry (fault_addr);
-  /* (1) If it's not a valid reference, then check if it's in
-     a growable region. If yes, expand the user stack. */
-  if (!pte)
+
+  /* 3. Handle logic using a 'success' flag instead of multiple exit points.
+     This changes the branching structure in assembly. */
+  if (pte != NULL)
   {
-    if (!expand_stack (fault_addr, f->esp))
-      exit (-1);
+    /* Case A: Valid PTE found. Try to load the page. */
+    success = handle_mm_fault (pte);
   }
-  /* (2) If it's a valid reference, then get an available frame.
-     'handle_mm_fault' function in process.c will do this. */
   else
   {
-    if (!handle_mm_fault (pte))
-      exit (-1);
+    /* Case B: No PTE found. Try to grow the stack. */
+    success = expand_stack (fault_addr, f->esp);
   }
 
-  /* As you can see a flow above, any unexpected condition will 
-     be treated as a 'segmentation fault' situation. (exit(-1)) 
-     And, if there's no segmentation/protection fault, that is,
-     if it is the (1) stack-growth situation or (2) page fault
-     situation, then the system will restart the process. */
+  /* 4. Final consolidated check.
+     If the handler returned false, kill the process. */
+  if (!success)
+    exit (-1);
 }
