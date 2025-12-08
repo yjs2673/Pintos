@@ -38,35 +38,36 @@ void syscall_init (void);
 #define STACK_CHECK(vaddr, esp) if(!pt_find_entry (vaddr)) { if (!expand_stack (vaddr, esp)) exit (-1); }  
 #define USER_ADDR_CHECK(param_num, esp) for(int i=1;i<=param_num;i++){POINTER_CHECK(ARG_ADDR(i)); STACK_CHECK(ARG_ADDR(i), esp); }
 
+/* It indicates that an error occurs in the 'open' syscall. */
+#define OPEN_FILE_ERROR -1
+
+/* Binary semaphore providing the mutual 
+   exclusion while accessing the file system. */
+extern struct lock access_lock;
+
 /* Process Identifier type. */
 typedef int pid_t;
 
 /* Mapping Identifier type. */
 typedef unsigned mapid_t;
 
-/* Binary semaphore providing the mutual 
-   exclusion while accessing the file system. */
-extern struct lock access_lock;
-
-/* It indicates that an error occurs in the 'open' syscall. */
-#define OPEN_FILE_ERROR -1
-
 /* Routines to perform each system call functionality. */
-void halt (void);
 void exit (int status);
+void halt (void);
 pid_t exec (const char *cmd_line);
-int wait (pid_t pid);
 bool create (const char *file, unsigned initial_size);
 bool remove (const char *file);
-int open (const char *file);
 int filesize (int fd);
-int read (int fd, void *buffer, unsigned size);
-int write (int fd, const void *buffer, unsigned size);
-void seek (int fd, unsigned position);
-unsigned tell (int fd);
+int open (const char *file);
 void close (int fd);
-int fibonacci (int n);
+int read (int fd, void *buffer, unsigned size);
+void seek (int fd, unsigned position);
 int max_of_four_int (int a, int b, int c, int d);
+int wait (pid_t pid);
+int write (int fd, const void *buffer, unsigned size);
+unsigned tell (int fd);
+int fibonacci (int n);
+
 mapid_t mmap (int fd, void *addr);
 void munmap (mapid_t mapid);
 
