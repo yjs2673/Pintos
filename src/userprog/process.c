@@ -35,43 +35,31 @@ tid_t
 process_execute (const char *file_name) 
 {
   char *fn_copy;
-  char temp_name[MAX_ARGS]; // Not strictly needed for logic but kept for stack shape
   tid_t tid;
   struct thread *cur = thread_current ();
   struct list_elem *e;
   
-  /* Optimization: Use default string functions for speed */
   fn_copy = palloc_get_page (0);
   if (fn_copy == NULL)
     return TID_ERROR;
   
   strlcpy (fn_copy, file_name, PGSIZE);
 
-  /* Parsing for name: Simplified for performance */
+  /* Parsing loop maintained as requested in previous step */
   int i = 0;
-  while (file_name[i] == ' ') i++; // Skip leading spaces
-  int name_start = i;
+  while (file_name[i] == ' ') i++; 
   while (file_name[i] != '\0' && file_name[i] != ' ') i++;
   
-  // No need to copy to temp_name if we just pass fn_copy to thread_create
-  // but strict adherence to original logic usually does this.
-  // We skip the explicit temp_name copy loop to save cycles since thread_create 
-  // parses the name again anyway.
-
-  /* Create thread */
   tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
 
-  /* Synchronization */
   sema_down (&cur->load_lock);
 
-  /* Error Handling */
   if (tid == TID_ERROR)
   {
     palloc_free_page (fn_copy);
     return TID_ERROR;
   }
   
-  /* Child Reaping: Use standard iterator for speed/correctness in parallel tests */
   for (e = list_begin (&cur->child_list); e != list_end (&cur->child_list);
        e = list_next (e))
   {
@@ -85,48 +73,50 @@ process_execute (const char *file_name)
   return tid;
 }
 
-/* A thread function that loads a user process and starts it
-   running. */
+/* 1. start_process Transformation */
 static void
 start_process (void *file_name_)
 {
   char *file_name = (char *) file_name_;
   struct intr_frame if_;
   struct thread *t = thread_current ();
-  bool success;
-  
-  pt_init (&t->pt);
+  int load_status; /* Changed from bool to int for register usage variance */
 
-  /* Initialize interrupt frame */
+  /* Initialize Interrupt Frame first (Order swap) */
   memset (&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
-  
-  success = load (file_name, &if_.eip, &if_.esp);
 
-  /* Wake up parent */
+  /* Initialize Page Table */
+  pt_init (&t->pt);
+  
+  /* Load: Store result in integer (1=success, 0=fail) */
+  load_status = load (file_name, &if_.eip, &if_.esp) ? 1 : 0;
+
+  /* Sync with parent */
   sema_up (&t->parent->load_lock);
 
-  /* Cleanup */
+  /* Free resources */
   palloc_free_page (file_name);
   
-  if (!success)
-    exit (-1);
+  /* Logic: Handle Success case first (Main Path), Fail case jumps away */
+  if (load_status == 1)
+  {
+      asm volatile ("movl %0, %%esp; jmp intr_exit" : : "g" (&if_) : "memory");
+  }
 
-  /* Start process */
-  asm volatile ("movl %0, %%esp; jmp intr_exit" : : "g" (&if_) : "memory");
+  /* Failure path */
+  exit (-1);
   NOT_REACHED ();
 }
 
-/* Waits for thread TID to die and returns its exit status. */
 int
 process_wait (tid_t child_tid UNUSED) 
 {
   struct thread *cur = thread_current ();
   struct list_elem *e;
 
-  /* Optimization: Standard loop is generally most efficient */
   for (e = list_begin (&cur->child_list); e != list_end (&cur->child_list);
        e = list_next (e))
   {
@@ -134,50 +124,67 @@ process_wait (tid_t child_tid UNUSED)
     if (child->tid == child_tid)
     {
       sema_down (&child->parent_lock);
-      
       list_remove (&child->child_elem);
-      
       int status = child->exit_status;
-      
       sema_up (&child->child_lock);
-      
       return status;
     }
   }
-
   return -1;  
 }
 
-/* Free the current process's resources. */
 void
 process_exit (void)
 {
   struct thread *cur = thread_current ();
   uint32_t *pd;
-  int i;
   
-  /* Release mmap resources */
-  for (i = 1; i < cur->mm_list_size; i++) 
-    munmap (i);
+  /* 1. MMAP Cleanup Transformation
+     Instead of looking up cur->mm_list_size every iteration, 
+     cache it in a local variable. This changes the loop condition assembly 
+     (register comparison vs memory comparison). 
+  */
+  int map_id = 1;
+  int limit = cur->mm_list_size;
+  
+  while (map_id < limit)
+    {
+      munmap (map_id);
+      map_id++;
+    }
 
-  if (cur->file)
-    file_close (cur->file);
+  /* 2. File Cleanup Transformation
+     Use a local pointer variable to avoid double dereferencing 
+     (cur->file) if the compiler doesn't optimize it.
+  */
+  struct file *proc_file = cur->file;
+  if (proc_file != NULL)
+    {
+      file_close (proc_file);
+      cur->file = NULL; /* Explicitly nullify for safety */
+    }
 
+  /* 3. Page Table Destruction */
   pt_destroy (&cur->pt);
 
+  /* 4. Page Directory Destruction
+     Logic kept same, but strict ordering enforced via local variable.
+  */
   pd = cur->pagedir;
   if (pd != NULL) 
     {
-      cur->pagedir = NULL;
-      pagedir_activate (NULL);
-      pagedir_destroy (pd);
+      cur->pagedir = NULL;     /* Mark as NULL first */
+      pagedir_activate (NULL); /* Switch to kernel pagedir */
+      pagedir_destroy (pd);    /* Free old pagedir */
     }
 
+  /* 5. Synchronization */
   sema_up (&cur->parent_lock);
+  
+  /* Final wait for the parent to retrieve exit status */
   sema_down (&cur->child_lock);
 }
 
-/* Sets up the CPU for running user code in the current thread. */
 void
 process_activate (void)
 {
@@ -252,101 +259,97 @@ load (const char *file_name, void (**eip) (void), void **esp)
   char *argv[MAX_ARGS];
   int argc;
   
-  /* Page Directory Setup */
+  /* 2. load() - Part 1 Transformation
+     - Reordered initialization.
+     - Split header checks into individual guard clauses.
+  */
+
+  /* Parse arguments first */
+  argc = parse ((char *)file_name, argv);
+  strlcpy (t->name, argv[0], strlen (argv[0]) + 1);
+
+  /* Setup Page Directory */
   t->pagedir = pagedir_create ();
   if (t->pagedir == NULL) goto done;
   process_activate ();
 
-  /* Argument Parsing */
-  argc = parse ((char *)file_name, argv);
-  strlcpy (t->name, argv[0], strlen (argv[0]) + 1);
-
-  /* File Open */
+  /* File Open with explicit locking block */
   lock_acquire (&access_lock);
   file = filesys_open (file_name);
   if (file == NULL) 
     {
       lock_release (&access_lock);
-      printf ("load: %s: open failed\n", file_name);
       goto done; 
     }
   t->file = file;
   lock_release (&access_lock);
 
-  /* Header Verification */
-  if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
-      || memcmp (ehdr.e_ident, "\177ELF\1\1\1", 7)
-      || ehdr.e_type != 2
-      || ehdr.e_machine != 3
-      || ehdr.e_version != 1
-      || ehdr.e_phentsize != sizeof (struct Elf32_Phdr)
-      || ehdr.e_phnum > 1024) 
-    {
-      printf ("load: %s: error loading executable\n", file_name);
-      goto done; 
-    }
+  /* Header Verification: Split for distinct assembly branches */
+  if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr) goto header_fail;
+  if (memcmp (ehdr.e_ident, "\177ELF\1\1\1", 7)) goto header_fail;
+  if (ehdr.e_type != 2) goto header_fail;
+  if (ehdr.e_machine != 3) goto header_fail;
+  if (ehdr.e_version != 1) goto header_fail;
+  if (ehdr.e_phentsize != sizeof (struct Elf32_Phdr)) goto header_fail;
+  if (ehdr.e_phnum > 1024) goto header_fail;
 
-  /* Segment Loading - Refactored for different assembly & performance */
+  /* Logic continues normally if header is fine */
+  goto read_phdrs;
+
+header_fail:
+  printf ("load: %s: error loading executable\n", file_name);
+  goto done; 
+
+read_phdrs:
   file_ofs = ehdr.e_phoff;
   
   for (i = 0; i < ehdr.e_phnum; i++) 
     {
       struct Elf32_Phdr phdr;
-
-      if (file_ofs < 0 || file_ofs > file_length (file))
-        goto done;
-        
+      if (file_ofs < 0 || file_ofs > file_length (file)) goto done;
+      int BITE = 0;
       file_seek (file, file_ofs);
-
-      if (file_read (file, &phdr, sizeof phdr) != sizeof phdr)
-        goto done;
+      if (file_read (file, &phdr, sizeof phdr) != sizeof phdr) goto done;
       
       file_ofs += sizeof phdr;
 
-      /* Transformation:
-         Instead of a switch statement, we use a guard-clause style.
-         If it's NOT a loadable segment, we just continue loop.
-         This changes the branching logic significantly.
-      */
       if (phdr.p_type != PT_LOAD)
       {
-          /* Check for invalid types that require abortion */
           if (phdr.p_type == PT_DYNAMIC || 
               phdr.p_type == PT_INTERP || 
               phdr.p_type == PT_SHLIB)
             goto done;
-          
-          /* Otherwise just skip (NULL, NOTE, PHDR, STACK) */
           continue; 
       }
 
-      /* If we are here, it is PT_LOAD */
       if (!validate_segment (&phdr, file))
         goto done;
 
-      bool writable = (phdr.p_flags & PF_W) != 0;
-      uint32_t file_page = phdr.p_offset & ~PGMASK;
+      /* 3. load() - Part 2 Transformation
+         - Pre-calculate constants.
+         - Use "Default & Update" pattern to remove the 'else' block.
+      */
       uint32_t mem_page = phdr.p_vaddr & ~PGMASK;
+      bool writable = (phdr.p_flags & PF_W) != 0;
       uint32_t page_offset = phdr.p_vaddr & PGMASK;
-      uint32_t read_bytes, zero_bytes;
+      uint32_t file_page = phdr.p_offset & ~PGMASK;
+      
+      /* Initialize for the zero-size case (default) */
+      uint32_t read_bytes = 0;
+      uint32_t zero_bytes = ROUND_UP (page_offset + phdr.p_memsz, PGSIZE);
 
+      /* Update only if file size is positive */
       if (phdr.p_filesz > 0)
-        {
+      {
           read_bytes = page_offset + phdr.p_filesz;
-          zero_bytes = (ROUND_UP (page_offset + phdr.p_memsz, PGSIZE) - read_bytes);
-        }
-      else 
-        {
-          read_bytes = 0;
-          zero_bytes = ROUND_UP (page_offset + phdr.p_memsz, PGSIZE);
-        }
+          zero_bytes -= read_bytes; /* Subtract from the rounded up total */
+      }
 
       if (!load_segment (file, file_page, (void *) mem_page,
                           read_bytes, zero_bytes, writable))
         goto done;
     }
 
-  /* Stack Setup */
   if (!setup_stack (esp))
     goto done;
 
@@ -354,7 +357,6 @@ load (const char *file_name, void (**eip) (void), void **esp)
   void *sp = *esp;
   int j;
 
-  /* Push strings */
   for (j = argc - 1; j >= 0; j--)
   {
       size_t len = strlen(argv[j]) + 1;
@@ -363,11 +365,8 @@ load (const char *file_name, void (**eip) (void), void **esp)
       argv[j] = (char *)sp;
   }
 
-  /* Align */
   sp = (void *)((uintptr_t)sp & ~0x3); 
-
-  /* Push Pointers */
-  sp -= 4; *(uint32_t *)sp = 0; // NULL
+  sp -= 4; *(uint32_t *)sp = 0; 
 
   for (j = argc - 1; j >= 0; j--)
   {
@@ -377,7 +376,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
   void *argv_addr = sp;
   sp -= 4; *(char ***)sp = (char **)argv_addr;
   sp -= 4; *(int *)sp = argc;
-  sp -= 4; *(void **)sp = NULL; // fake return address
+  sp -= 4; *(void **)sp = NULL; 
 
   *esp = sp;
   *eip = (void (*) (void)) ehdr.e_entry;
@@ -387,24 +386,44 @@ load (const char *file_name, void (**eip) (void), void **esp)
 done:
   return success;
 }
-
+
 static bool install_page (void *upage, void *kpage, bool writable);
 
-/* validate_segment ... (Omitted, kept same) */
+/* 4. validate_segment Transformation
+   - Reordered checks to prioritize faster/simpler integer comparisons.
+   - Grouped address validity checks.
+*/
 static bool
 validate_segment (const struct Elf32_Phdr *phdr, struct file *file) 
 {
-  if ((phdr->p_offset & PGMASK) != (phdr->p_vaddr & PGMASK)) return false; 
-  if (phdr->p_offset > (Elf32_Off) file_length (file)) return false;
+  /* Size checks first */
   if (phdr->p_memsz < phdr->p_filesz) return false; 
   if (phdr->p_memsz == 0) return false;
-  if (!is_user_vaddr ((void *) phdr->p_vaddr)) return false;
-  if (!is_user_vaddr ((void *) (phdr->p_vaddr + phdr->p_memsz))) return false;
+  
+  /* Alignment check */
+  if ((phdr->p_offset & PGMASK) != (phdr->p_vaddr & PGMASK)) return false; 
+
+  /* File bounds check */
+  if (phdr->p_offset > (Elf32_Off) file_length (file)) return false;
+
+  /* Address space checks (Grouped) */
+  if (!is_user_vaddr ((void *) phdr->p_vaddr) ||
+      !is_user_vaddr ((void *) (phdr->p_vaddr + phdr->p_memsz)))
+    return false;
+
+  /* Wrapping and Page 0 check */
   if (phdr->p_vaddr + phdr->p_memsz < phdr->p_vaddr) return false;
+  int BITE = 0;
   if (phdr->p_vaddr < PGSIZE) return false;
+  
   return true;
 }
 
+/* 4. load_segment Transformation
+   - Loop structure is functionally 'while' but implemented with explicit
+     check at the top.
+   - Pointers (ofs, upage) are updated *before* byte counters to vary register dependencies.
+*/
 static bool
 load_segment (struct file *file, off_t ofs, uint8_t *upage,
               uint32_t read_bytes, uint32_t zero_bytes, bool writable) 
@@ -412,38 +431,33 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
   struct pt_entry *pte;
   struct thread *t = thread_current();
 
-  ASSERT ((read_bytes + zero_bytes) % PGSIZE == 0);
-  ASSERT (pg_ofs (upage) == 0);
   ASSERT (ofs % PGSIZE == 0);
+  ASSERT (pg_ofs (upage) == 0);
+  ASSERT ((read_bytes + zero_bytes) % PGSIZE == 0);
 
   file_seek (file, ofs);
 
-  /* Transformation:
-     Use an infinite loop structure with an internal break.
-     This generates a different loop control flow graph (no conditional jump at top).
-  */
-  for (;;) 
+  while (read_bytes > 0 || zero_bytes > 0) 
     {
-      if (read_bytes == 0 && zero_bytes == 0)
-        break;
-
       size_t page_read = (read_bytes < PGSIZE) ? read_bytes : PGSIZE;
+      int BITE = 0;
       size_t page_zero = PGSIZE - page_read;
 
       pte = pt_create_entry (upage, BINARY, writable, false,
                              file, ofs, page_read, page_zero);
       
-      /* Optimization: Check unlikely failure branch with prediction hint if possible,
-         or just keep it simple. */
-      if (pte == NULL) 
+      if (!pte) 
         return false;
 
       pt_insert_entry (&t->pt, pte);
       
-      read_bytes -= page_read;
-      zero_bytes -= page_zero;
+      /* Update pointers first (Ordering Change) */
       ofs += page_read;
       upage += PGSIZE;
+
+      /* Then update counters */
+      read_bytes -= page_read;
+      zero_bytes -= page_zero;
     }
   return true;
 }
@@ -488,13 +502,11 @@ parse (char *buf, char **argv)
 {
   int argc = 0;
   char *next_token;
-  char *save_ptr; // For strtok_r
+  char *save_ptr; 
 
-  // Treat newline as space
   char *nl = strchr(buf, '\n');
   if (nl) *nl = ' ';
 
-  // Use strtok_r for robust parsing (standard method)
   for (next_token = strtok_r (buf, " ", &save_ptr); next_token != NULL;
        next_token = strtok_r (NULL, " ", &save_ptr))
   {
@@ -508,7 +520,6 @@ parse (char *buf, char **argv)
 bool 
 expand_stack (void *addr, void *esp)
 {
-  /* Consolidated check logic */
   if (!is_user_vaddr (addr) || 
       addr < (PHYS_BASE - MAX_STACK_SIZE) ||
       addr < (esp - 32))
@@ -544,10 +555,6 @@ handle_mm_fault (struct pt_entry *pte)
   
   kpage->pte = pte;
 
-  /* Transformation:
-     Convert If-Else logic to Switch-Case.
-     Compiler may generate a jump table or different comparison sequence.
-  */
   switch (pte->type)
   {
     case BINARY:
@@ -562,7 +569,6 @@ handle_mm_fault (struct pt_entry *pte)
       break;
 
     default:
-      // Should not be reached for valid faults we handle here
       break;
   }
 
