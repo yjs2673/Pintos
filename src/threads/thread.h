@@ -112,7 +112,9 @@ struct thread
 #endif
 
     /* Virtual Memory */
-    struct hash pt;              /* Supplemental page table */
+    struct hash pt;                     /* Supplemental page table */
+    struct list mmap_list;              /* Memory mapped files */
+    int next_mapid;                     /* Next mmap ID */
 
     /* Owned by thread.c. */
     unsigned magic;                     /* Detects stack overflow. */

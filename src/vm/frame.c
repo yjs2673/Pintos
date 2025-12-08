@@ -124,11 +124,18 @@ static void vm_second_chance (void) {
 }
 
 bool load_file_to_page (void *kaddr, struct pt_entry *pte)  {
-  lock_acquire (&filesys_lock);
+  /* 현재 스레드가 이미 filesys_lock을 가지고 있는지 확인 */
+  bool lock_held = lock_held_by_current_thread (&filesys_lock);
+    
+  /* 락을 안 가지고 있을 때만 획득 */
+  if (!lock_held)
+    lock_acquire (&filesys_lock);
     
   size_t bytes_read = file_read_at(pte->file, kaddr, pte->read_bytes, pte->offset);
     
-  lock_release (&filesys_lock);
+  /* 락을 획득했던 경우에만 해제 */
+  if (!lock_held)
+    lock_release (&filesys_lock);
 
   if (bytes_read != pte->read_bytes) return false;
     

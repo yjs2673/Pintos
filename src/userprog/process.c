@@ -21,6 +21,7 @@
 #include "threads/malloc.h"
 #include "vm/frame.h"
 #include "vm/swap.h"
+#include "vm/mmap.h"
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
@@ -188,6 +189,14 @@ process_exit (void)
   /* 이전에 열었던 모든 파일들을 닫기 */
   for (int i = 2; i < 128; i++) if (cur->fd[i] != NULL) sys_close(i);
 
+  /* Clean up mmap files */
+  while (!list_empty (&cur->mmap_list))
+  {
+    struct list_elem *e = list_front (&cur->mmap_list);
+    struct mmap_file *mf = list_entry (e, struct mmap_file, elem);
+    munmap (mf->mapid);
+  }
+  /* Destroy the supplemental page table */
   pt_destroy(&cur->pt);
 
   /* 실행 파일 닫고 쓰기를 허용 */

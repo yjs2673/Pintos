@@ -478,6 +478,13 @@ init_thread (struct thread *t, const char *name, int priority)
   t->exec_file = NULL;
   t->load_success = false;
   list_push_back(&(running_thread()->child_list), &(t->child_elem));
+
+  #ifdef VM
+  /* VM will be initialized later in load() after malloc is ready */
+  list_init(&t->mmap_list);
+  t->next_mapid = 1;
+  #endif
+
 #endif
 }
 
