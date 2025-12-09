@@ -24,17 +24,17 @@
 
 /* Bitmap indicates the 'freed or allocated' info.
    That is, it represents the status of the swap table. */
+#define OFS_ZERO 0x00      /* Starting offset of the block structure. */
+#define OFS_MAX 0x08       /* Maximum offset of the block structure. */
 extern struct bitmap *swap_bitmap;
-#define OFS_ZERO 0      /* Starting offset of the block structure. */
-#define OFS_MAX 8       /* Maximum offset of the block structure. */
 
 /* These only four functions are interfaces of this header.
    swap_init should be called in the beginning of the system,
    and the other three will be used in the frame management.
    (That is, main user(customer) of this header is 'frame.c') */
 void swap_init (void);
-void swap_in (size_t index, void *kaddr);
-size_t swap_out (void *kaddr);
 void swap_free (size_t index);
+size_t swap_out (void *kaddr);
+void swap_in (size_t index, void *kaddr);
 
 #endif

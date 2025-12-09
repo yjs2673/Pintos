@@ -43,26 +43,26 @@
 struct frame 
 { 
   void *kaddr;                  /* Physical Address of this frame. */
-  struct thread *thread;        /* The thread who uses this frame. */
   struct pt_entry *pte;         /* Pointer to the mapped PTE for this. */
   struct list_elem frame_elem;  /* Iterator for the page replacement. */
+  struct thread *thread;        /* The thread who uses this frame. */
 };
-
-/* Frame table based on the list structure. */
-extern struct list frame_list;
 
 /* Global iterator that cycles the frame table.
    That is, we use a clock algorithm to search for evicting. */
 extern struct list_elem *frame_clock;
+
+/* Frame table based on the list structure. */
+extern struct list frame_list;
 
 /* These only four functions are interfaces of this header. 
    ft_init should be called in the beginning of the system,
    and the other three will be used in the loading management.
    (page replacement is abstracted inside those functions) */
 void ft_init (void);
+bool load_file_to_page (void *kaddr, struct pt_entry *pte);
 struct frame *alloc_page (enum palloc_flags flags);
 void free_page (void *kaddr);
-bool load_file_to_page (void *kaddr, struct pt_entry *pte);
 
 /* In fact, it would be better that loading mechanisms like 'alloc_page' is
    implemented in 'threads/palloc.h' in perspective of its meanings. 

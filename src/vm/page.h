@@ -73,34 +73,34 @@ struct pt_entry
   /* Information about the page. */
   void *vaddr;                  /* VPN(Virtual Page Number). */
   pt_type type;                 /* Type of page indicated by this PTE. */
-  bool writable;                /* Is it OK to write to this page? */
   bool is_loaded;               /* Is this page loaded onto physical memory? */
+  bool writable;                /* Is it OK to write to this page? */
+
+  /* Variables about file mapped to this page. */
+  struct file *file;            /* Pointer to the mapped file. */
+  size_t read_bytes;            /* Number of bytes written on page. */
+  size_t zero_bytes;            /* Number of rest of bytes of that page. */
+  size_t offset;                /* Current file position of the file. */
+
+  /* If this page is mapped to disk(swapping). */
+  size_t swap_slot;             /* Index of the slot for swapping this. */
 
   /* Used for hash operations. */
   struct hash_elem elem;        /* Hash element for each page table. */
 
-  /* Variables about file mapped to this page. */
-  struct file *file;            /* Pointer to the mapped file. */
-  size_t offset;                /* Current file position of the file. */
-  size_t read_bytes;            /* Number of bytes written on page. */
-  size_t zero_bytes;            /* Number of rest of bytes of that page. */
-
   /* If this page is used for the memory mapping. */
   struct list_elem mm_elem;     /* Iterator for the mmap list. */
-
-  /* If this page is mapped to disk(swapping). */
-  size_t swap_slot;             /* Index of the slot for swapping this. */
 };
 
 /* These six functions are interfaces of this header. The main user
    of this header is 'process.c', and 'syscall.c' uses this as well,
    especially in the subroutines of lazy loading implementation.  */
 void pt_init (struct hash *pt);
-void pt_destroy (struct hash *pt);
+struct pt_entry *pt_find_entry (void *vaddr);
+bool pt_delete_entry (struct hash *pt, struct pt_entry *pte);
+bool pt_insert_entry (struct hash *pt, struct pt_entry *pte);
 struct pt_entry *pt_create_entry (void *vaddr, pt_type type, bool writable, bool is_loaded,
     struct file *file, size_t offset, size_t read_bytes, size_t zero_bytes);
-bool pt_insert_entry (struct hash *pt, struct pt_entry *pte);
-bool pt_delete_entry (struct hash *pt, struct pt_entry *pte);
-struct pt_entry *pt_find_entry (void *vaddr);
+void pt_destroy (struct hash *pt);
 
 #endif
