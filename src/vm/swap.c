@@ -3,11 +3,11 @@
 #include "threads/synch.h"
 #include "threads/vaddr.h"
 
-/* Provides sector-based I/O access for swapping. */
-struct block *swap_block;
-struct bitmap *swap_bitmap;
 /* For the synchronization of accessing disk. */
 struct lock swap_lock;
+/* Provides sector-based I/O access for swapping. */
+struct bitmap *swap_bitmap;
+struct block *swap_block;
 
 /* Initialize the block and bitmap data structures for swapping. 
    The size of the swap partition of pintOS is 4or8MB and it's 
@@ -29,9 +29,11 @@ void
 swap_in (size_t index, void *kaddr)
 {
   size_t ofs;
+  bool idx = false;
+  if (index--) idx = true;
 
   /* Passed index must be bigger than 0. */
-  if (index--)
+  if (idx)
   {
     /* Obtain the block structure. */
     swap_block = block_get_role (BLOCK_SWAP);
@@ -39,9 +41,13 @@ swap_in (size_t index, void *kaddr)
     lock_acquire (&swap_lock);
 
     /* Read(swap in) the corresponding slot. */
-    for (ofs = OFS_ZERO; ofs < OFS_MAX; ofs++)
-      block_read (swap_block, (index * OFS_MAX) + ofs,
+    ofs = 0;
+    while (ofs < 8)
+    {
+      block_read (swap_block, (index * 8) + ofs,
         kaddr + (BLOCK_SECTOR_SIZE * ofs));
+      ofs++;
+    }
 
     /* Unset the corresponding bit of bitmap. */
     bitmap_set_multiple (swap_bitmap, index, 1, false);
@@ -71,9 +77,13 @@ swap_out (void *kaddr)
 
   /* Write(swap out) the evicted frame into the 
      corresponding swap slot in the disk (swap space). */
-  for (ofs = OFS_ZERO; ofs < OFS_MAX; ofs++)
-    block_write (swap_block, swap_index * OFS_MAX + ofs,
-      kaddr + BLOCK_SECTOR_SIZE * ofs);
+  ofs = 0;
+  while (ofs < 8)
+  {
+    block_write (swap_block, (swap_index * 8) + ofs,
+      kaddr + (BLOCK_SECTOR_SIZE * ofs));
+    ofs++;
+  }
 
   lock_release (&swap_lock);
   
@@ -86,7 +96,10 @@ swap_out (void *kaddr)
 void 
 swap_free (size_t index)
 {
-  if (index--)
+  bool idx = false;
+  if (index--) idx = true;
+
+  if (idx)
   {
     lock_acquire (&swap_lock);
 
