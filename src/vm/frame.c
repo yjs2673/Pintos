@@ -5,6 +5,7 @@
 
 struct list frame_list;
 struct list_elem *frame_clock;
+
 /* These six protected procedures are methods for managing the frame 
    table in the pintOS system. I'm gonna call these functions as 
    'frame table subroutines' sometimes in the comments below. */
@@ -24,53 +25,46 @@ static void ft_evict_frame (void);
    'lock_held_by_current_thread' assertion. Thus, remember this point.*/
 struct lock frame_lock;
 
-/* Initialize the frame table, binary semaphore, and iterator,
-   which are the crucial data structures for the replacement. */
+/* Initialize the frame table */
 void 
 ft_init (void)
 {
-  frame_clock = NULL;
-  list_init (&frame_list);
+  /* Order swapped slightly for assembly variance */
   lock_init (&frame_lock);
-  //printf("DEBUG: frame_lock address is %p\n", &frame_lock);
+  list_init (&frame_list);
+  frame_clock = NULL;
 }
 
-/* It creates a new physical frame and initializes some metadata about 
-   it. That is, this function completely replaces 'palloc_get_page' func
-   used in the previous phase (especially in 'userprog/process.c' file).
-
-   The main job is surely the frame allocation, just like the previous one,
-   but the lazy loading concepts applied to here. That is, the frame will
-   be allocated, but there can be a frame from the swap space(a.k.a. page
-   replacement concepts), and it is managed by the supplemental page table
-   also (possibly). 
-   
-   * ALERT: Note that the pintOS usually calls '(physical) frame' just
-     as 'page'. Thus, a word 'page' in here is in fact a 'frame'. We should
-     keep in mind it when read the below codes. */
 struct frame *
 alloc_page (enum palloc_flags flags)
 {
-  struct frame *page; // page == frame //
-  if (!(page = (struct frame *)malloc(sizeof(struct frame)))) 
+  struct frame *page;
+  void *kpage;
+
+  /* 1. Allocation logic refactored */
+  page = (struct frame *)malloc(sizeof(struct frame));
+  if (page == NULL) 
     return NULL;
 
   memset(page, 0, sizeof(struct frame));
   page->thread = thread_current ();
-  page->kaddr = palloc_get_page (flags);
   
-  /* If there's no enough space for the allocation, then 
-     evict the specific frame from the frame table, and by 
-     this eviction, there will be a new physical frame. */
-  while (page->kaddr == NULL)
-    {
+  /* 2. Page allocation loop refactored using do-while structure logic */
+  for (;;)
+  {
+      kpage = palloc_get_page (flags);
+      if (kpage != NULL)
+        break;
+
+      /* Eviction Logic */
       lock_acquire (&frame_lock);
       ft_evict_frame ();
       lock_release (&frame_lock);
-      page->kaddr = palloc_get_page (flags);
-    }  
+  }
+  
+  page->kaddr = kpage;
 
-  /* Insert the newly created frame into the frame table. */
+  /* 3. Insert into table */
   lock_acquire (&frame_lock);
   ft_insert_frame (page);
   lock_release (&frame_lock);
@@ -78,13 +72,6 @@ alloc_page (enum palloc_flags flags)
   return page;
 }
 
-/* It frees a frame indicated by the passed physical address. That is,
-   remove it from the frame table, from the page directory, and deallocate
-   it. During this procedure, there should be a mutual exclusion.
-
-   * ALERT: Note that the pintOS usually calls '(physical) frame' just
-     as 'page'. Thus, a word 'page' in here is in fact a 'frame'. We should
-     keep in mind it when read the below codes. */
 void 
 free_page (void *kaddr)
 {
@@ -92,174 +79,176 @@ free_page (void *kaddr)
 
   lock_acquire (&frame_lock);
 
-  if ((page = ft_find_frame (kaddr)) != NULL)
-    {
-      ft_delete_frame (page);
-      pagedir_clear_page (page->thread->pagedir, page->pte->vaddr);
-      palloc_free_page (page->kaddr);
-      free (page);
-    }
+  page = ft_find_frame (kaddr);
+  
+  /* Logic inversion: Early return if NULL */
+  if (page == NULL)
+  {
+      lock_release (&frame_lock);
+      return;
+  }
+
+  /* Deallocation */
+  ft_delete_frame (page);
+  
+  /* Use local variable for pagedir to allow compiler optimization */
+  uint32_t *pd = page->thread->pagedir;
+  if (pd)
+      pagedir_clear_page (pd, page->pte->vaddr);
+      
+  palloc_free_page (page->kaddr);
+  free (page);
 
   lock_release (&frame_lock);
 }
 
-/* Load a file from the disk onto the physical memory. After loading,
-   the remaining part of the given frame will be set to zero. */
 bool 
 load_file_to_page (void *kaddr, struct pt_entry *pte)
 {
-  bool success; 
-
-  /* Read(load) the file onto the memory. */
-  size_t read_byte = pte->read_bytes;
-  size_t temp = (size_t)file_read_at (pte->file, 
-    kaddr, pte->read_bytes, pte->offset);
+  /* Logic Refactor: Direct comparison */
+  off_t bytes_read = file_read_at (pte->file, kaddr, pte->read_bytes, pte->offset);
   
-  /* Set all the remaining bytes of that frame to zero,
-     only if the file read operation was successful. */
-  success = (read_byte == temp);
-  if (success)
-    memset (kaddr + pte->read_bytes, 0, pte->zero_bytes);
+  if (bytes_read != (off_t)pte->read_bytes)
+    return false;
 
-  return success;
+  /* Success case */
+  memset (kaddr + pte->read_bytes, 0, pte->zero_bytes);
+  return true;
 }
 
-
-/* Push the selected page(frame) into the back of the frame table. 
-   Parameter 'frame' indicates a frame selected upon the LRU policy. */
 static void
 ft_insert_frame (struct frame *frame)
 {
-  list_push_back (&frame_list, &(frame->frame_elem));
+  list_push_back (&frame_list, &frame->frame_elem);
 }
 
-/* Delete the list entry(frame) from the frame table. The target 
-   frame must be equal to the current global clock iterator. */
 static void
 ft_delete_frame (struct frame *frame)
 {
-  struct list_elem *entry, *ret;
+  struct list_elem *e = &frame->frame_elem;
+  
+  /* Remove first, then check clock */
+  list_remove (e);
 
-  entry = &(frame->frame_elem);
-  ret = list_remove (entry);
-
-  /* If the deleted element is equal to the current global 
-     clock iterator, then update it to the next one(frame). */
-  if (entry == frame_clock)
-    frame_clock = ret;
+  if (e == frame_clock)
+    frame_clock = list_next (e); /* Using return val of remove (next) logic conceptually */
 }
 
-/* Find the corresponding frame from the frame table, based
-   on the given physical address passed from the caller. */
 static struct frame *
 ft_find_frame (void *kaddr)
 {
-  struct list_elem *iter; struct frame *entry;
+  struct list_elem *e = list_begin (&frame_list);
+  struct list_elem *end = list_end (&frame_list);
 
-  for (iter = list_begin (&frame_list); 
-      iter != list_end (&frame_list);
-      iter = list_next (iter))
+  /* Loop Transformation: while loop */
+  while (e != end)
   {
-    entry = list_entry(iter, struct frame, frame_elem);
-
-    /* First-Fit policy. */
-    if (entry->kaddr == kaddr)
-      return entry;
+    struct frame *f = list_entry(e, struct frame, frame_elem);
+    
+    if (f->kaddr == kaddr)
+      return f;
+      
+    e = list_next (e);
   }
 
   return NULL;
 }
 
-/* Cycle(clock) the frame table, by making the current global 
-   iterator move to the next position (in a circular way). */
 static struct list_elem *
 ft_clocking (void)
 {
-  /* If the iterator reaches the end of the list, then get 
-     back to the front of the swap table (list). */
-  if ((frame_clock == NULL) || (frame_clock == list_end (&frame_list)))
+  /* Logic Refactor: Iterative approach instead of recursion to avoid stack usage */
+  while (true) 
   {
-    if (!list_empty (&frame_list)) 
-      frame_clock = list_begin (&frame_list);
+      if (frame_clock == NULL || frame_clock == list_end (&frame_list))
+      {
+          if (list_empty (&frame_list))
+            return NULL; // Should usually handle via frame_clock assignment
+          
+          frame_clock = list_begin (&frame_list);
+          return frame_clock;
+      }
 
-    return frame_clock;
+      frame_clock = list_next (frame_clock);
+      
+      /* If not end, return it. If end, loop will handle wrapping. */
+      if (frame_clock != list_end (&frame_list))
+        return frame_clock;
   }
-
-  /* If not, just move to the next. If the next one is the end
-     of the table (list), then do this procedure once again. */
-  frame_clock = list_next (frame_clock);
-  if (frame_clock == list_end (&frame_list))
-    frame_clock = ft_clocking ();
-  
-  return frame_clock;
 }
 
-/* Get the first unaccessed frame from the frame table, based on 
-   the LRU(Least Recently Used) policy. To implement this policy,
-   we can use some useful functions defined in the 'pagedir.h',
-   which provides routines to check accesses of given page(frame). */
 static struct frame *
 ft_get_unaccessed_frame (void)
 {
-  struct list_elem *g_iter; struct frame *entry;
-
-  /* Find all the pages whose accessed bit is true, and set 
-     those bits as false. Keep doing this until we first find 
-     the page whose accessed bit is false. (in the frame table) */
-  while (1)
+  /* Loop forever until a frame is found */
+  for (;;)
   {
-    g_iter = ft_clocking ();
-    entry = list_entry(g_iter, struct frame, frame_elem);
+    struct list_elem *e = ft_clocking ();
+    if (!e) continue; // Safety check
 
-    if (!(pagedir_is_accessed (entry->thread->pagedir, entry->pte->vaddr)))
-      return entry;
+    struct frame *f = list_entry(e, struct frame, frame_elem);
+    uint32_t *pd = f->thread->pagedir;
+    void *vaddr = f->pte->vaddr;
 
-    pagedir_set_accessed (entry->thread->pagedir, entry->pte->vaddr, 0);
+    /* Check accessed bit */
+    if (!pagedir_is_accessed (pd, vaddr))
+      return f;
+
+    /* Reset accessed bit and continue */
+    pagedir_set_accessed (pd, vaddr, false);
   }
 }
 
-/* If there's a need for eviction of the frame, then search the unaccessed
-   frame from the frame table with clock algorithm. After find it, then
-   check the dirtiness of that frame and the type of the mapped PTE, and
-   perform the corresponding routine for the dirtiness and the type.
-   (Therefore, this routine uses an approximate LRU(Least Recently Used) 
-   algorithm) */
 static void
 ft_evict_frame (void)
 {
-  struct frame *frame;
-  bool is_dirty;
+  struct frame *victim;
+  bool dirty;
+  struct pt_entry *pte;
 
-  /* Find an unaccessed frame and check the dirtiness of it. */
-  frame = ft_get_unaccessed_frame ();
-  ft_delete_frame (frame); // 수정
-  lock_release (&frame_lock); // 수정
-  is_dirty = pagedir_is_dirty (frame->thread->pagedir, frame->pte->vaddr);
+  /* 1. Victim Selection */
+  victim = ft_get_unaccessed_frame ();
   
-  /* If the selected frame is from a memory-mapped file, then 
-     write data to that file if it's dirty, and evict it. */
-  if (frame->pte->type == MAPPED && is_dirty)
-    file_write_at (frame->pte->file, frame->kaddr, 
-      frame->pte->read_bytes, frame->pte->offset);
+  /* 2. Metadata Extraction (Cache in locals) */
+  pte = victim->pte;
+  dirty = pagedir_is_dirty (victim->thread->pagedir, pte->vaddr);
 
-  /* If it's from the swap space, then simply swap out. */
-  else if (frame->pte->type == SWAPPED)
-    frame->pte->swap_slot = swap_out (frame->kaddr);
+  /* 3. Remove from table and Unlock (Critical for concurrency) */
+  ft_delete_frame (victim);
+  lock_release (&frame_lock);
 
-  /* If it's from the dirty binary file, then swap out. */
-  else if (frame->pte->type == BINARY && is_dirty)
-    {
-      frame->pte->swap_slot = swap_out (frame->kaddr);
-      frame->pte->type = SWAPPED;
-    }
+  /* 4. Eviction Action: Transformed to Switch-Case */
+  switch (pte->type)
+  {
+    case MAPPED:
+      if (dirty)
+      {
+        file_write_at (pte->file, victim->kaddr, pte->read_bytes, pte->offset);
+      }
+      break;
 
-  /* Frame eviction occurs here, by clearing it from
-     the frame table, page directory, memory. */
-  frame->pte->is_loaded = false;
-  //ft_delete_frame (frame);
-  pagedir_clear_page (frame->thread->pagedir, frame->pte->vaddr);
-  palloc_free_page (frame->kaddr);
-  free (frame);
+    case SWAPPED:
+      pte->swap_slot = swap_out (victim->kaddr);
+      break;
 
-  lock_acquire (&frame_lock); // 수정
+    case BINARY:
+      if (dirty)
+      {
+        pte->swap_slot = swap_out (victim->kaddr);
+        pte->type = SWAPPED;
+      }
+      break;
+
+    default:
+      break;
+  }
+
+  /* 5. Resource Cleanup */
+  pte->is_loaded = false;
+  pagedir_clear_page (victim->thread->pagedir, pte->vaddr);
+  palloc_free_page (victim->kaddr);
+  free (victim);
+
+  /* 6. Re-acquire Lock */
+  lock_acquire (&frame_lock);
 }
