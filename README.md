@@ -14,9 +14,9 @@
 • 유닉스(리눅스) 기반의 다양한 프로그램 개발 환경을 수월하게 사용할 수 있으며, 운영체제 프로그램을
 디버깅할 수 있다.
 
-|프로젝트 번호|프로젝트 이름|
-|:---:|:---:|
-|1st project|User Program 1|
-|2nd project|User Program 2|
-|3rd project|Threads|
-|4th project|Virtual Memory|
+|프로젝트 번호|프로젝트 이름|구현 내용|
+|:---:|:---:|:---:|
+|1st project|User Program 1|Argument Passing, System Calls|
+|2nd project|User Program 2|File System Call Implementation, Synchronization APIs|
+|3rd project|Threads|Alarm Clock, BSD Scheduler|
+|4th project|Virtual Memory|Pagie Table Management, Paging to and from Swap Disk, Stack Growth|
